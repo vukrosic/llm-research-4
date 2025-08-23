@@ -296,6 +296,15 @@ if TRITON_AVAILABLE:
             self.register_buffer('cos', theta.cos(), persistent=False)
             self.register_buffer('sin', theta.sin(), persistent=False)
         
+        def to(self, device=None, dtype=None, non_blocking=False):
+            """Override to method to handle dtype conversion"""
+            super().to(device, dtype, non_blocking)
+            if dtype is not None:
+                # Convert buffers to the specified dtype
+                self.cos = self.cos.to(dtype)
+                self.sin = self.sin.to(dtype)
+            return self
+        
         def forward(self, q, k):
             batch_size, n_heads, seq_len, d_head = q.shape
             
@@ -329,6 +338,14 @@ class TritonRMSNormLayer(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
     
+    def to(self, device=None, dtype=None, non_blocking=False):
+        """Override to method to handle dtype conversion"""
+        super().to(device, dtype, non_blocking)
+        if dtype is not None:
+            # Convert parameter to the specified dtype
+            self.weight.data = self.weight.data.to(dtype)
+        return self
+    
     def forward(self, x):
         if TRITON_AVAILABLE:
             orig_shape = x.shape
@@ -357,6 +374,15 @@ class TritonRotary(nn.Module):
         theta = torch.einsum("i,j -> ij", t, angular_freq)
         self.register_buffer('cos', theta.cos(), persistent=False)
         self.register_buffer('sin', theta.sin(), persistent=False)
+    
+    def to(self, device=None, dtype=None, non_blocking=False):
+        """Override to method to handle dtype conversion"""
+        super().to(device, dtype, non_blocking)
+        if dtype is not None:
+            # Convert buffers to the specified dtype
+            self.cos = self.cos.to(dtype)
+            self.sin = self.sin.to(dtype)
+        return self
     
     def forward(self, q, k):
         if TRITON_AVAILABLE:
@@ -562,6 +588,16 @@ class TritonGatedMLP(nn.Module):
         self.w2 = nn.Parameter(torch.randn(d_ff, d_model) * 0.02)
         self.w3 = nn.Parameter(torch.randn(d_model, d_ff) * 0.02)
     
+    def to(self, device=None, dtype=None, non_blocking=False):
+        """Override to method to handle dtype conversion"""
+        super().to(device, dtype, non_blocking)
+        if dtype is not None:
+            # Convert parameter dtypes
+            self.w1.data = self.w1.data.to(dtype)
+            self.w2.data = self.w2.data.to(dtype)
+            self.w3.data = self.w3.data.to(dtype)
+        return self
+    
     def forward(self, x):
         if TRITON_AVAILABLE:
             B, T, D = x.shape
@@ -637,6 +673,15 @@ class TritonAttention(nn.Module):
         self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
         self.w_o = nn.Linear(d_model, d_model, bias=False)
         self.rotary = TritonRotary(self.d_k, max_seq_len)
+    
+    def to(self, device=None, dtype=None, non_blocking=False):
+        """Override to method to handle dtype conversion"""
+        super().to(device, dtype, non_blocking)
+        if dtype is not None:
+            # Convert linear layer weights to the specified dtype
+            self.qkv.weight.data = self.qkv.weight.data.to(dtype)
+            self.w_o.weight.data = self.w_o.weight.data.to(dtype)
+        return self
     
     def forward(self, x):
         if TRITON_AVAILABLE:
@@ -813,6 +858,15 @@ class Rotary(nn.Module):
         self.register_buffer('cos', theta.cos(), persistent=False)
         self.register_buffer('sin', theta.sin(), persistent=False)
 
+    def to(self, device=None, dtype=None, non_blocking=False):
+        """Override to method to handle dtype conversion"""
+        super().to(device, dtype, non_blocking)
+        if dtype is not None:
+            # Convert buffers to the specified dtype
+            self.cos = self.cos.to(dtype)
+            self.sin = self.sin.to(dtype)
+        return self
+
     def forward(self, x_BTHD: torch.Tensor):
         assert self.cos.size(0) >= x_BTHD.size(-3)
         cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
@@ -839,6 +893,15 @@ class MultiHeadAttention(nn.Module):
             
         self.dropout = dropout
 
+    def to(self, device=None, dtype=None, non_blocking=False):
+        """Override to method to handle dtype conversion"""
+        super().to(device, dtype, non_blocking)
+        if dtype is not None:
+            # Convert linear layer weights to the specified dtype
+            self.qkv.weight.data = self.qkv.weight.data.to(dtype)
+            self.w_o.weight.data = self.w_o.weight.data.to(dtype)
+        return self
+
     def forward(self, x):
         batch_size, seq_len = x.size(0), x.size(1)
 
@@ -861,6 +924,15 @@ class FeedForward(nn.Module):
         self.linear1 = nn.Linear(d_model, d_ff, bias=False)
         self.linear2 = nn.Linear(d_ff, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
+
+    def to(self, device=None, dtype=None, non_blocking=False):
+        """Override to method to handle dtype conversion"""
+        super().to(device, dtype, non_blocking)
+        if dtype is not None:
+            # Convert linear layer weights to the specified dtype
+            self.linear1.weight.data = self.linear1.weight.data.to(dtype)
+            self.linear2.weight.data = self.linear2.weight.data.to(dtype)
+        return self
 
     def forward(self, x):
         return self.linear2(self.dropout(F.silu(self.linear1(x))))
