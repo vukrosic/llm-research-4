@@ -16,6 +16,17 @@ import warnings
 import os
 import pickle
 import wandb
+
+# Triton imports
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+    print("🚀 Triton available - will use for performance optimization")
+except ImportError:
+    TRITON_AVAILABLE = False
+    print("⚠️  Triton not available - using PyTorch implementations only")
+
 warnings.filterwarnings('ignore')
 
 def set_seed(seed: int = 42):
@@ -69,6 +80,11 @@ class ModelConfig:
     def __post_init__(self):
         self.d_k = self.d_model // self.n_heads
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
+        
+        # Performance optimization settings
+        self.use_triton_rmsnorm: bool = True
+        self.use_triton_rotary: bool = True
+        self.benchmark_kernels: bool = True  # Auto-benchmark and select best
 
 @torch.compile
 def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
@@ -91,6 +107,214 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5) -> torch.Tensor
         X = X.mT
 
     return X
+
+# ============= TRITON KERNELS =============
+
+if TRITON_AVAILABLE:
+    @triton.jit
+    def rms_norm_fwd_kernel(
+        X,  # input
+        Y,  # output
+        W,  # weight (gamma)
+        rstd,  # reciprocal standard deviation
+        stride,
+        N,  # number of columns
+        eps: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Fused RMSNorm forward kernel - optimized version"""
+        row = tl.program_id(0)
+        X += row * stride
+        Y += row * stride
+        
+        # Compute variance in a single pass with better memory access
+        var = 0.0
+        for off in range(0, N, BLOCK_SIZE):
+            cols = off + tl.arange(0, BLOCK_SIZE)
+            mask = cols < N
+            x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
+            var += tl.sum(x * x, axis=0)
+        
+        var = var / N
+        rstd_val = 1 / tl.sqrt(var + eps)
+        tl.store(rstd + row, rstd_val)
+        
+        # Normalize and apply weight in a single pass
+        for off in range(0, N, BLOCK_SIZE):
+            cols = off + tl.arange(0, BLOCK_SIZE)
+            mask = cols < N
+            x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
+            w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+            y = x * rstd_val * w
+            tl.store(Y + cols, y, mask=mask)
+
+    @triton.jit
+    def rms_norm_bwd_kernel(
+        X, W, DY, DX, DW,
+        rstd,
+        stride,
+        N,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """RMSNorm backward kernel"""
+        row = tl.program_id(0)
+        X += row * stride
+        DY += row * stride
+        DX += row * stride
+        
+        rstd_val = tl.load(rstd + row)
+        
+        # Compute gradients
+        _sum = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+        for off in range(0, N, BLOCK_SIZE):
+            cols = off + tl.arange(0, BLOCK_SIZE)
+            mask = cols < N
+            x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
+            dy = tl.load(DY + cols, mask=mask, other=0.0).to(tl.float32)
+            w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+            
+            # Accumulate for dW
+            tl.atomic_add(DW + cols, (x * rstd_val * dy).to(tl.float32), mask=mask)
+            
+            # Compute sum for dx
+            _sum += x * dy * w
+        
+        sum_val = tl.sum(_sum, axis=0) / N
+        
+        # Compute dx
+        for off in range(0, N, BLOCK_SIZE):
+            cols = off + tl.arange(0, BLOCK_SIZE)
+            mask = cols < N
+            x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
+            dy = tl.load(DY + cols, mask=mask, other=0.0).to(tl.float32)
+            w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+            
+            dx = rstd_val * w * (dy - x * sum_val * rstd_val * rstd_val)
+            tl.store(DX + cols, dx, mask=mask)
+
+    class TritonRMSNorm(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, weight, eps=1e-5):
+            assert x.is_cuda and weight.is_cuda
+            M, N = x.shape
+            y = torch.empty_like(x)
+            rstd = torch.empty(M, dtype=torch.float32, device=x.device)
+            
+            # Use larger block size for better GPU utilization
+            BLOCK_SIZE = min(1024, triton.next_power_of_2(N))
+            grid = (M,)
+            
+            rms_norm_fwd_kernel[grid](
+                x, y, weight, rstd,
+                x.stride(0),
+                N,
+                eps=eps,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
+            
+            ctx.save_for_backward(x, weight, rstd)
+            ctx.BLOCK_SIZE = BLOCK_SIZE
+            ctx.N = N
+            return y
+        
+        @staticmethod
+        def backward(ctx, dy):
+            x, weight, rstd = ctx.saved_tensors
+            M, N = x.shape
+            
+            dx = torch.empty_like(x)
+            dw = torch.zeros_like(weight)
+            
+            grid = (M,)
+            
+            rms_norm_bwd_kernel[grid](
+                x, weight, dy, dx, dw,
+                rstd,
+                x.stride(0),
+                N,
+                BLOCK_SIZE=ctx.BLOCK_SIZE,
+            )
+            
+            return dx, dw, None
+
+    @triton.jit
+    def rotary_kernel(
+        Q, K,
+        cos, sin,
+        seqlen,
+        d_head,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Apply rotary position embeddings"""
+        batch_head_idx = tl.program_id(0)
+        seq_idx = tl.program_id(1)
+        
+        # Calculate offsets
+        q_offset = batch_head_idx * seqlen * d_head + seq_idx * d_head
+        k_offset = batch_head_idx * seqlen * d_head + seq_idx * d_head
+        
+        # Process in chunks
+        for i in range(0, d_head // 2, BLOCK_SIZE):
+            idx = i + tl.arange(0, BLOCK_SIZE)
+            mask = idx < d_head // 2
+            
+            # Load Q and K values
+            q1 = tl.load(Q + q_offset + idx, mask=mask, other=0.0)
+            q2 = tl.load(Q + q_offset + idx + d_head // 2, mask=mask, other=0.0)
+            k1 = tl.load(K + k_offset + idx, mask=mask, other=0.0)
+            k2 = tl.load(K + k_offset + idx + d_head // 2, mask=mask, other=0.0)
+            
+            # Load cos and sin
+            c = tl.load(cos + seq_idx * (d_head // 2) + idx, mask=mask, other=0.0)
+            s = tl.load(sin + seq_idx * (d_head // 2) + idx, mask=mask, other=0.0)
+            
+            # Apply rotation
+            q1_new = q1 * c + q2 * s
+            q2_new = q1 * (-s) + q2 * c
+            k1_new = k1 * c + k2 * s
+            k2_new = k1 * (-s) + k2 * c
+            
+            # Store results
+            tl.store(Q + q_offset + idx, q1_new, mask=mask)
+            tl.store(Q + q_offset + idx + d_head // 2, q2_new, mask=mask)
+            tl.store(K + k_offset + idx, k1_new, mask=mask)
+            tl.store(K + k_offset + idx + d_head // 2, k2_new, mask=mask)
+
+    class TritonRotary(nn.Module):
+        def __init__(self, dim: int, max_seq_len: int):
+            super().__init__()
+            self.dim = dim
+            
+            # Precompute cos and sin
+            angular_freq = (1 / 10000) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+            t = torch.arange(max_seq_len, dtype=torch.float32)
+            theta = torch.einsum("i,j -> ij", t, angular_freq)
+            self.register_buffer('cos', theta.cos(), persistent=False)
+            self.register_buffer('sin', theta.sin(), persistent=False)
+        
+        def forward(self, q, k):
+            batch_size, n_heads, seq_len, d_head = q.shape
+            
+            # Reshape for kernel
+            q = q.reshape(batch_size * n_heads, seq_len, d_head)
+            k = k.reshape(batch_size * n_heads, seq_len, d_head)
+            
+            # Apply rotary embeddings
+            grid = (batch_size * n_heads, seq_len)
+            BLOCK_SIZE = triton.next_power_of_2(d_head // 2)
+            
+            rotary_kernel[grid](
+                q, k,
+                self.cos, self.sin,
+                seq_len, d_head,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
+            
+            # Reshape back
+            q = q.reshape(batch_size, n_heads, seq_len, d_head)
+            k = k.reshape(batch_size, n_heads, seq_len, d_head)
+            
+            return q, k
 
 class Muon(torch.optim.Optimizer):
     """Muon - MomentUm Orthogonalized by Newton-schulz"""
@@ -231,7 +455,7 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, max_seq_len: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, n_heads: int, max_seq_len: int, dropout: float = 0.1, use_triton_rotary: bool = False):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
@@ -239,7 +463,13 @@ class MultiHeadAttention(nn.Module):
 
         self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
         self.w_o = nn.Linear(d_model, d_model, bias=False)
-        self.rotary = Rotary(self.d_k, max_seq_len)
+        
+        # Choose Rotary implementation based on performance
+        if use_triton_rotary and TRITON_AVAILABLE:
+            self.rotary = TritonRotary(self.d_k, max_seq_len)
+        else:
+            self.rotary = Rotary(self.d_k, max_seq_len)
+            
         self.dropout = dropout
 
     def forward(self, x):
@@ -269,12 +499,19 @@ class FeedForward(nn.Module):
         return self.linear2(self.dropout(F.silu(self.linear1(x))))
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, max_seq_len: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, max_seq_len: int, dropout: float = 0.1, use_triton_rmsnorm: bool = False):
         super().__init__()
-        self.attention = MultiHeadAttention(d_model, n_heads, max_seq_len, dropout)
+        self.attention = MultiHeadAttention(d_model, n_heads, max_seq_len, dropout, use_triton_rotary=use_triton_rmsnorm)
         self.feed_forward = FeedForward(d_model, d_ff, dropout)
-        self.norm1 = nn.RMSNorm(d_model)
-        self.norm2 = nn.RMSNorm(d_model)
+        
+        # Choose RMSNorm implementation based on performance
+        if use_triton_rmsnorm and TRITON_AVAILABLE:
+            self.norm1 = TritonRMSNormLayer(d_model)
+            self.norm2 = TritonRMSNormLayer(d_model)
+        else:
+            self.norm1 = nn.RMSNorm(d_model)
+            self.norm2 = nn.RMSNorm(d_model)
+            
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -293,11 +530,18 @@ class MinimalLLM(nn.Module):
         self.position_dropout = nn.Dropout(config.dropout)
 
         self.transformer_blocks = nn.ModuleList([
-            TransformerBlock(config.d_model, config.n_heads, config.d_ff, config.max_seq_len, config.dropout)
+            TransformerBlock(
+                config.d_model, config.n_heads, config.d_ff, config.max_seq_len, config.dropout,
+                use_triton_rmsnorm=config.use_triton_rmsnorm
+            )
             for _ in range(config.n_layers)
         ])
 
-        self.norm = nn.RMSNorm(config.d_model)
+        # Choose final norm implementation based on performance
+        if config.use_triton_rmsnorm and TRITON_AVAILABLE:
+            self.norm = TritonRMSNormLayer(config.d_model)
+        else:
+            self.norm = nn.RMSNorm(config.d_model)
         self.output_dropout = nn.Dropout(config.dropout)
 
         # Tie weights
@@ -358,6 +602,163 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig
     model.train()
     return {'val_loss': avg_loss, 'val_accuracy': accuracy, 'val_perplexity': perplexity}
 
+# ============= KERNEL BENCHMARKING AND AUTO-SELECTION =============
+
+def benchmark_rms_norm(batch_size: int, seq_len: int, d_model: int, num_runs: int = 50) -> Dict[str, float]:
+    """Benchmark RMSNorm implementations"""
+    device = torch.device('cuda')
+    
+    # Create test data
+    x = torch.randn(batch_size, seq_len, d_model, device=device, dtype=torch.float16)
+    
+    # PyTorch RMSNorm
+    pytorch_norm = nn.RMSNorm(d_model).to(device, dtype=torch.float16)
+    
+    # Warmup
+    for _ in range(10):
+        _ = pytorch_norm(x)
+    
+    torch.cuda.synchronize()
+    
+    # Benchmark PyTorch
+    start_time = time.time()
+    for _ in range(num_runs):
+        _ = pytorch_norm(x)
+    torch.cuda.synchronize()
+    pytorch_time = time.time() - start_time
+    
+    if TRITON_AVAILABLE:
+        # Triton RMSNorm
+        triton_norm = TritonRMSNormLayer(d_model).to(device, dtype=torch.float16)
+        
+        # Warmup
+        for _ in range(10):
+            _ = triton_norm(x)
+        
+        torch.cuda.synchronize()
+        
+        # Benchmark Triton
+        start_time = time.time()
+        for _ in range(num_runs):
+            _ = triton_norm(x)
+        torch.cuda.synchronize()
+        triton_time = time.time() - start_time
+        
+        return {
+            'pytorch_time': pytorch_time / num_runs * 1000,  # ms
+            'triton_time': triton_time / num_runs * 1000,    # ms
+            'speedup': pytorch_time / triton_time,
+            'use_triton': triton_time < pytorch_time
+        }
+    else:
+        return {
+            'pytorch_time': pytorch_time / num_runs * 1000,
+            'triton_time': float('inf'),
+            'speedup': 1.0,
+            'use_triton': False
+        }
+
+def benchmark_rotary(batch_size: int, seq_len: int, n_heads: int, d_head: int, num_runs: int = 50) -> Dict[str, float]:
+    """Benchmark Rotary implementations"""
+    device = torch.device('cuda')
+    
+    # Create test data
+    q = torch.randn(batch_size, n_heads, seq_len, d_head, device=device, dtype=torch.float16)
+    k = torch.randn(batch_size, n_heads, seq_len, d_head, device=device, dtype=torch.float16)
+    
+    # PyTorch Rotary
+    pytorch_rotary = Rotary(d_head, seq_len).to(device)
+    
+    # Warmup
+    for _ in range(10):
+        _ = pytorch_rotary(q)
+    
+    torch.cuda.synchronize()
+    
+    # Benchmark PyTorch
+    start_time = time.time()
+    for _ in range(num_runs):
+        _ = pytorch_rotary(q)
+    torch.cuda.synchronize()
+    pytorch_time = time.time() - start_time
+    
+    if TRITON_AVAILABLE:
+        # Triton Rotary
+        triton_rotary = TritonRotary(d_head, seq_len).to(device)
+        
+        # Warmup
+        for _ in range(10):
+            _ = triton_rotary(q, k)
+        
+        torch.cuda.synchronize()
+        
+        # Benchmark Triton
+        start_time = time.time()
+        for _ in range(num_runs):
+            _ = triton_rotary(q, k)
+        torch.cuda.synchronize()
+        triton_time = time.time() - start_time
+        
+        return {
+            'pytorch_time': pytorch_time / num_runs * 1000,
+            'triton_time': triton_time / num_runs * 1000,
+            'speedup': pytorch_time / triton_time,
+            'use_triton': triton_time < pytorch_time
+        }
+    else:
+        return {
+            'pytorch_time': pytorch_time / num_runs * 1000,
+            'triton_time': float('inf'),
+            'speedup': 1.0,
+            'use_triton': False
+        }
+
+def auto_select_kernels(config: ModelConfig) -> Dict[str, bool]:
+    """Automatically benchmark and select the best kernels for the current configuration"""
+    if not config.benchmark_kernels or not TRITON_AVAILABLE:
+        return {
+            'use_triton_rmsnorm': False,
+            'use_triton_rotary': False
+        }
+    
+    print("🔍 Auto-benchmarking kernels for optimal performance...")
+    
+    # Test with current configuration
+    batch_size = min(config.batch_size, 16)  # Use smaller batch for benchmarking
+    seq_len = min(config.max_seq_len, 256)
+    d_model = config.d_model
+    n_heads = config.n_heads
+    d_head = d_model // n_heads
+    
+    print(f"  Testing with: batch_size={batch_size}, seq_len={seq_len}, d_model={d_model}")
+    
+    # Benchmark RMSNorm
+    print("  Benchmarking RMSNorm...")
+    rms_results = benchmark_rms_norm(batch_size, seq_len, d_model)
+    print(f"    PyTorch: {rms_results['pytorch_time']:.3f} ms")
+    if TRITON_AVAILABLE:
+        print(f"    Triton:  {rms_results['triton_time']:.3f} ms")
+        print(f"    Speedup: {rms_results['speedup']:.2f}x")
+        print(f"    Using:   {'Triton' if rms_results['use_triton'] else 'PyTorch'}")
+    
+    # Benchmark Rotary
+    print("  Benchmarking Rotary...")
+    rotary_results = benchmark_rotary(batch_size, seq_len, n_heads, d_head)
+    print(f"    PyTorch: {rotary_results['pytorch_time']:.3f} ms")
+    if TRITON_AVAILABLE:
+        print(f"    Triton:  {rotary_results['triton_time']:.3f} ms")
+        print(f"    Speedup: {rotary_results['speedup']:.2f}x")
+        print(f"    Using:   {'Triton' if rotary_results['use_triton'] else 'PyTorch'}")
+    
+    # Update config with best choices
+    config.use_triton_rmsnorm = rms_results['use_triton']
+    config.use_triton_rotary = rotary_results['use_triton']
+    
+    return {
+        'use_triton_rmsnorm': rms_results['use_triton'],
+        'use_triton_rotary': rotary_results['use_triton']
+    }
+
 def setup_muon_optimizer(model: nn.Module, config: ModelConfig):
     """Setup Muon optimizer with hybrid approach"""
     muon_params = []
@@ -409,6 +810,12 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
 
     # Initialize model
     set_seed(42)
+    
+    # Auto-select best kernels based on performance
+    if config.benchmark_kernels:
+        kernel_selection = auto_select_kernels(config)
+        print(f"  🚀 Kernel selection: RMSNorm={'Triton' if kernel_selection['use_triton_rmsnorm'] else 'PyTorch'}, Rotary={'Triton' if kernel_selection['use_triton_rotary'] else 'PyTorch'}")
+    
     model = MinimalLLM(config)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
@@ -419,6 +826,11 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
     # Log model architecture to wandb
     wandb.run.summary["total_parameters"] = total_params
     wandb.run.summary["model_architecture"] = f"{config.d_model}d-{config.n_layers}L-{config.n_heads}H-{config.d_ff}ff"
+    
+    # Log kernel selection
+    if config.benchmark_kernels:
+        wandb.run.summary["use_triton_rmsnorm"] = config.use_triton_rmsnorm
+        wandb.run.summary["use_triton_rotary"] = config.use_triton_rotary
 
     # Setup optimizers
     optimizers = setup_muon_optimizer(model, config)
@@ -612,6 +1024,47 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
     wandb.finish()
 
     return model, final_eval
+
+def manual_kernel_benchmark():
+    """Manual function to benchmark kernels independently"""
+    if not TRITON_AVAILABLE:
+        print("❌ Triton not available. Cannot run kernel benchmark.")
+        return
+    
+    print("🔍 Manual Kernel Benchmark")
+    print("=" * 40)
+    
+    # Test configurations
+    configs = [
+        {'batch_size': 16, 'seq_len': 256, 'd_model': 384, 'n_heads': 8},
+        {'batch_size': 32, 'seq_len': 512, 'd_model': 768, 'n_heads': 12},
+        {'batch_size': 64, 'seq_len': 1024, 'd_model': 1024, 'n_heads': 16},
+    ]
+    
+    for i, config in enumerate(configs):
+        print(f"\n Configuration {i+1}: {config['batch_size']}x{config['seq_len']}x{config['d_model']}")
+        print("-" * 50)
+        
+        # RMSNorm benchmark
+        rms_results = benchmark_rms_norm(
+            config['batch_size'], config['seq_len'], config['d_model']
+        )
+        print(f"  RMSNorm:")
+        print(f"    PyTorch: {rms_results['pytorch_time']:.3f} ms")
+        print(f"    Triton:  {rms_results['triton_time']:.3f} ms")
+        print(f"    Speedup: {rms_results['speedup']:.2f}x")
+        print(f"    Winner:  {'Triton' if rms_results['use_triton'] else 'PyTorch'}")
+        
+        # Rotary benchmark
+        d_head = config['d_model'] // config['n_heads']
+        rotary_results = benchmark_rotary(
+            config['batch_size'], config['seq_len'], config['n_heads'], d_head
+        )
+        print(f"  Rotary:")
+        print(f"    PyTorch: {rotary_results['pytorch_time']:.3f} ms")
+        print(f"    Triton:  {rotary_results['triton_time']:.3f} ms")
+        print(f"    Speedup: {rotary_results['speedup']:.2f}x")
+        print(f"    Winner:  {'Triton' if rotary_results['use_triton'] else 'PyTorch'}")
 
 if __name__ == "__main__":
     # Check system
