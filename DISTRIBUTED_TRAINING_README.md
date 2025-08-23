@@ -19,6 +19,7 @@ This setup provides distributed training across multiple GPUs with periodic chec
 - `list_checkpoints.py` - List available checkpoints
 - `resume_training.py` - Resume multi-GPU training from checkpoint
 - `resume_single_gpu.py` - Resume single-GPU training from checkpoint
+- `test_checkpoint_loading.py` - Test and diagnose checkpoint loading issues
 - `run_distributed.sh` - Launch script for distributed training
 
 ## 🏃‍♂️ Quick Start
@@ -220,6 +221,11 @@ The patient presents with chest pain and shortness of breath. The symptoms began
 3. **Import errors**
    - Ensure all dependencies are installed
    - Check file paths and imports
+
+4. **PyTorch 2.6+ checkpoint loading errors**
+   - Run: `python test_checkpoint_loading.py` to diagnose
+   - The resume scripts now handle PyTorch 2.6+ compatibility automatically
+   - If issues persist, try: `python test_checkpoint_loading.py`
 
 ### Performance Tips
 
