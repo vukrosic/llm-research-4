@@ -559,7 +559,7 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
 
                 if eval_metrics['val_loss'] < best_val_loss:
                     best_val_loss = eval_metrics['val_loss']
-                    # Save best model checkpoint
+                    # Save best model checkpoint locally (not to wandb)
                     torch.save({
                         'step': step,
                         'model_state_dict': model.state_dict(),
@@ -569,8 +569,7 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
                         'best_val_loss': best_val_loss,
                     }, f"best_model_step_{step}.pt")
                     
-                    # Log best model to wandb
-                    wandb.save(f"best_model_step_{step}.pt")
+                    print(f"💾 Saved best model checkpoint to best_model_step_{step}.pt")
 
             step += 1
             if step % 100 == 0:
@@ -596,7 +595,7 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
         "final/val_perplexity": final_eval['val_perplexity'],
     })
     
-    # Save final model
+    # Save final model locally (not to wandb)
     final_model_path = "final_model.pt"
     torch.save({
         'step': step,
@@ -607,8 +606,7 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
         'final_val_loss': final_eval['val_loss'],
     }, final_model_path)
     
-    # Log final model to wandb
-    wandb.save(final_model_path)
+    print(f"💾 Saved final model to {final_model_path}")
     
     # Finish wandb run
     wandb.finish()
