@@ -1,67 +1,71 @@
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
-from torch.cuda.amp import autocast, GradScaler
+from datasets import load_dataset
+from transformers import AutoTokenizer
+import pickle
 import os
-import time
-from llm import MinimalLLM, ModelConfig, set_seed, setup_muon_optimizer, evaluate_model
+from tqdm import tqdm
 
-def setup_distributed(rank, world_size):
-    """Initialize distributed training"""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
+class CentralDataServer:
+    def __init__(self, num_documents=500, max_tokens=200000, max_seq_len=512):
+        self.num_documents = num_documents
+        self.max_tokens = max_tokens
+        self.max_seq_len = max_seq_len
+        self.cache_dir = "data_cache"
+        
+    def load_and_cache_data(self):
+        """Load and cache tokenized data centrally"""
+        os.makedirs(self.cache_dir, exist_ok=True)
+        cache_file = f"{self.cache_dir}/thebluescrubs_tokenized_data_{self.num_documents}_{self.max_tokens}.pkl"
 
-def cleanup_distributed():
-    """Cleanup distributed training"""
-    dist.destroy_process_group()
+        if os.path.exists(cache_file):
+            print(f"📦 Loading cached data from {cache_file}")
+            with open(cache_file, 'rb') as f:
+                cached_data = pickle.load(f)
+            return cached_data
 
-def train_worker(rank, world_size, config):
-    """Training worker for each GPU"""
-    setup_distributed(rank, world_size)
-    
-    # Load data
-    from data_server import CentralDataServer
-    server = CentralDataServer(config.num_documents, config.max_tokens, config.max_seq_len)
+        print(f"🔄 Processing new data (will cache for future use)")
+        
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-135M", token=False)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # Load dataset
+        dataset = load_dataset("openmed-community/TheBlueScrubs-v1-fixed", split="train", streaming=True, token=False)
+        
+        texts = []
+        for i, item in enumerate(dataset):
+            if i >= self.num_documents:
+                break
+            text = item.get("text", "")
+            if text:
+                texts.append(text[:3000])
+
+        # Tokenize
+        print("Tokenizing texts...")
+        all_tokens = []
+        for text in tqdm(texts, desc="Tokenizing"):
+            tokens = tokenizer.encode(text, add_special_tokens=False)
+            all_tokens.extend(tokens)
+
+        tokens = all_tokens[:self.max_tokens]
+        
+        # Cache the processed data
+        cached_data = {
+            'texts': texts, 
+            'tokenizer': tokenizer, 
+            'tokens': tokens,
+            'vocab_size': tokenizer.vocab_size
+        }
+        
+        with open(cache_file, 'wb') as f:
+            pickle.dump(cached_data, f)
+
+        print(f"💾 Cached data to {cache_file}")
+        return cached_data
+
+if __name__ == "__main__":
+    # Test data loading
+    server = CentralDataServer()
     data = server.load_and_cache_data()
-    
-    # Create dataset
-    from llm import TextTokenDataset
-    dataset = TextTokenDataset(data['tokens'], config.max_seq_len)
-    
-    # Split data for distributed training
-    train_size = int(0.9 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
-    )
-    
-    # Create distributed samplers
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
-    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-    
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=config.batch_size, 
-        sampler=train_sampler,
-        num_workers=2,
-        pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=config.batch_size, 
-        sampler=val_sampler,
-        num_workers=2,
-        pin_memory=True
-    )
-    
-    # Create model
-    config.vocab_size = data['vocab_size']
-    model = MinimalLLM(config)
-    model = model.to(rank)
-    
-    # Wrap with
+    print(f"✅ Loaded {len(data['texts'])} documents, {len(data['tokens']):,} tokens")

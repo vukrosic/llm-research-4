@@ -6,7 +6,8 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.cuda.amp import autocast, GradScaler
 import os
 import time
-from llm import MinimalLLM, ModelConfig, set_seed, setup_muon_optimizer, evaluate_model
+from llm import MinimalLLM, ModelConfig, set_seed, setup_muon_optimizer, evaluate_model, TextTokenDataset
+from data_server import CentralDataServer
 
 def setup_distributed(rank, world_size):
     """Initialize distributed training"""
@@ -24,12 +25,10 @@ def train_worker(rank, world_size, config):
     setup_distributed(rank, world_size)
     
     # Load data
-    from data_server import CentralDataServer
     server = CentralDataServer(config.num_documents, config.max_tokens, config.max_seq_len)
     data = server.load_and_cache_data()
     
     # Create dataset
-    from llm import TextTokenDataset
     dataset = TextTokenDataset(data['tokens'], config.max_seq_len)
     
     # Split data for distributed training
@@ -127,7 +126,7 @@ def train_worker(rank, world_size, config):
 def main():
     """Main function to launch distributed training"""
     world_size = torch.cuda.device_count()
-    print(f"�� Found {world_size} GPUs")
+    print(f"🔍 Found {world_size} GPUs")
     
     if world_size < 2:
         print("❌ Need at least 2 GPUs for distributed training")
