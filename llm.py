@@ -15,6 +15,7 @@ from typing import List, Optional
 import warnings
 import os
 import pickle
+import wandb
 warnings.filterwarnings('ignore')
 
 def set_seed(seed: int = 42):
@@ -58,6 +59,12 @@ class ModelConfig:
     # Technical
     use_amp: bool = True
     vocab_size: Optional[int] = None
+
+    # Weights & Biases
+    wandb_project: str = "llm-med"
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
+    log_every: int = 10
 
     def __post_init__(self):
         self.d_k = self.d_model // self.n_heads
@@ -377,6 +384,29 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
     """Train the model with Muon optimizer"""
     print(f"\n🚀 Training Small model with Muon optimizer")
 
+    # Initialize wandb
+    wandb.init(
+        project=config.wandb_project,
+        entity=config.wandb_entity,
+        name=config.wandb_run_name,
+        config={
+            "architecture": f"{config.d_model}d-{config.n_layers}L-{config.n_heads}H-{config.d_ff}ff",
+            "batch_size": config.batch_size,
+            "max_steps": config.max_steps,
+            "max_seq_len": config.max_seq_len,
+            "num_documents": config.num_documents,
+            "max_tokens": config.max_tokens,
+            "muon_lr": config.muon_lr,
+            "gradient_accumulation_steps": config.gradient_accumulation_steps,
+            "weight_decay": config.weight_decay,
+            "dropout": config.dropout,
+            "grad_clip": config.grad_clip,
+            "use_amp": config.use_amp,
+            "eval_every": config.eval_every,
+            "eval_steps": config.eval_steps,
+        }
+    )
+
     # Initialize model
     set_seed(42)
     model = MinimalLLM(config)
@@ -385,6 +415,10 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  📊 Total parameters: {total_params:,}")
+    
+    # Log model architecture to wandb
+    wandb.run.summary["total_parameters"] = total_params
+    wandb.run.summary["model_architecture"] = f"{config.d_model}d-{config.n_layers}L-{config.n_heads}H-{config.d_ff}ff"
 
     # Setup optimizers
     optimizers = setup_muon_optimizer(model, config)
@@ -410,6 +444,12 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
     step = 0
     start_time = time.time()
     best_val_loss = float('inf')
+    
+    # Track metrics for wandb
+    running_loss = 0
+    running_accuracy = 0
+    running_perplexity = 0
+    metric_steps = 0
 
     pbar = tqdm(total=config.max_steps, desc="Training")
 
@@ -469,6 +509,39 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
                     'lr': f'{optimizers[0].param_groups[0]["lr"]:.2e}'
                 })
 
+            # Track running metrics for wandb
+            with torch.no_grad():
+                predictions = logits.argmax(dim=-1)
+                accuracy = (predictions == y).float().mean().item()
+                current_loss = loss.item() * config.gradient_accumulation_steps
+                perplexity = math.exp(min(current_loss, 20))
+                
+                running_loss += current_loss
+                running_accuracy += accuracy
+                running_perplexity += perplexity
+                metric_steps += 1
+
+            # Log to wandb every few steps
+            if step % config.log_every == 0 and step > 0:
+                avg_loss = running_loss / metric_steps
+                avg_accuracy = running_accuracy / metric_steps
+                avg_perplexity = running_perplexity / metric_steps
+                
+                wandb.log({
+                    "train/loss": avg_loss,
+                    "train/accuracy": avg_accuracy,
+                    "train/perplexity": avg_perplexity,
+                    "train/learning_rate": optimizers[0].param_groups[0]["lr"],
+                    "train/gradient_norm": grad_norm if 'grad_norm' in locals() else None,
+                    "train/step": step,
+                })
+                
+                # Reset running metrics
+                running_loss = 0
+                running_accuracy = 0
+                running_perplexity = 0
+                metric_steps = 0
+
             # Evaluation
             if step % config.eval_every == 0 and step > 0:
                 eval_metrics = evaluate_model(model, val_loader, config)
@@ -476,8 +549,28 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
                       f"Val Acc: {eval_metrics['val_accuracy']:.4f}, "
                       f"Val PPL: {eval_metrics['val_perplexity']:.2f}")
 
+                # Log validation metrics to wandb
+                wandb.log({
+                    "val/loss": eval_metrics['val_loss'],
+                    "val/accuracy": eval_metrics['val_accuracy'],
+                    "val/perplexity": eval_metrics['val_perplexity'],
+                    "val/step": step,
+                })
+
                 if eval_metrics['val_loss'] < best_val_loss:
                     best_val_loss = eval_metrics['val_loss']
+                    # Save best model checkpoint
+                    torch.save({
+                        'step': step,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_states': [opt.state_dict() for opt in optimizers],
+                        'scheduler_states': [sched.state_dict() for sched in schedulers],
+                        'config': config,
+                        'best_val_loss': best_val_loss,
+                    }, f"best_model_step_{step}.pt")
+                    
+                    # Log best model to wandb
+                    wandb.save(f"best_model_step_{step}.pt")
 
             step += 1
             if step % 100 == 0:
@@ -487,11 +580,38 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
 
     training_time = time.time() - start_time
     print(f"  ⏱️ Training completed in {training_time:.1f} seconds")
+    
+    # Log final training time
+    wandb.run.summary["training_time_seconds"] = training_time
 
     # Final evaluation
     final_eval = evaluate_model(model, val_loader, config)
     print(f"  📊 Final - Loss: {final_eval['val_loss']:.4f}, "
           f"Acc: {final_eval['val_accuracy']:.4f}, PPL: {final_eval['val_perplexity']:.2f}")
+    
+    # Log final metrics to wandb
+    wandb.log({
+        "final/val_loss": final_eval['val_loss'],
+        "final/val_accuracy": final_eval['val_accuracy'],
+        "final/val_perplexity": final_eval['val_perplexity'],
+    })
+    
+    # Save final model
+    final_model_path = "final_model.pt"
+    torch.save({
+        'step': step,
+        'model_state_dict': model.state_dict(),
+        'optimizer_states': [opt.state_dict() for opt in optimizers],
+        'scheduler_states': [sched.state_dict() for sched in schedulers],
+        'config': config,
+        'final_val_loss': final_eval['val_loss'],
+    }, final_model_path)
+    
+    # Log final model to wandb
+    wandb.save(final_model_path)
+    
+    # Finish wandb run
+    wandb.finish()
 
     return model, final_eval
 
@@ -507,11 +627,17 @@ if __name__ == "__main__":
 
     # Create config for Small model
     config = ModelConfig()
+    
+    # Set wandb run name if not specified
+    if config.wandb_run_name is None:
+        config.wandb_run_name = f"llm-med-{config.d_model}d-{config.n_layers}L-{config.n_heads}H"
+    
     print(f"\n📋 Model Configuration:")
     print(f"   Architecture: {config.d_model}d, {config.n_layers}L, {config.n_heads}H, {config.d_ff}ff")
     print(f"   Training: {config.max_steps} steps, batch size {config.batch_size}")
     print(f"   Data: {config.max_tokens:,} tokens, seq_len {config.max_seq_len}")
     print(f"   Dataset: TheBlueScrubs-v1-fixed (medical text)")
+    print(f"   Weights & Biases: {config.wandb_project}")
 
     # Load data
     texts, tokenizer, tokens = load_and_cache_data(config)
@@ -540,3 +666,4 @@ if __name__ == "__main__":
     print(f"   Validation Loss: {final_metrics['val_loss']:.4f}")
     print(f"   Validation Accuracy: {final_metrics['val_accuracy']:.4f}")
     print(f"   Validation Perplexity: {final_metrics['val_perplexity']:.2f}")
+    print(f"🏆 Check your Weights & Biases dashboard for detailed training logs!")
