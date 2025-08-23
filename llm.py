@@ -360,8 +360,10 @@ class TritonRMSNormLayer(nn.Module):
             x = TritonRMSNorm.apply(x, weight, self.eps)
             return x.view(orig_shape)
         else:
-            # Fallback to PyTorch RMSNorm
-            return F.layer_norm(x, (x.shape[-1],), self.weight, None, self.eps)
+            # Fallback to PyTorch RMSNorm - manual implementation
+            variance = x.pow(2).mean(-1, keepdim=True)
+            x = x * torch.rsqrt(variance + self.eps)
+            return x * self.weight
 
 class TritonRotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -1227,7 +1229,7 @@ def benchmark_attention(batch_size: int, seq_len: int, d_model: int, n_heads: in
     x = torch.randn(batch_size, seq_len, d_model, device=device, dtype=torch.float16)
     
     # PyTorch MultiHeadAttention
-    pytorch_attention = MultiHeadAttention(d_model, n_heads, seq_len).to(device)
+    pytorch_attention = MultiHeadAttention(d_model, n_heads, seq_len).to(device, dtype=torch.float16)
     
     # Warmup
     for _ in range(10):
@@ -1244,7 +1246,7 @@ def benchmark_attention(batch_size: int, seq_len: int, d_model: int, n_heads: in
     
     if TRITON_AVAILABLE:
         # Triton Attention
-        triton_attention = TritonAttention(d_model, n_heads, seq_len).to(device)
+        triton_attention = TritonAttention(d_model, n_heads, seq_len).to(device, dtype=torch.float16)
         
         # Warmup
         for _ in range(10):
