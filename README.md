@@ -1,3 +1,13 @@
+Code & Train Medical LLM from scratch
+
+Attention, RoPE, Muon optimizer,...
+
+- YouTube - https://youtu.be/95agKJ1o53E
+
+- Bilibili - https://www.bilibili.com/video/BV1qfeqzTExH/
+
+- If you want to learn to code LLMs (GPT-5, DeepSeek, Qwen3, Llama4) from scratch - https://github.com/vukrosic/open-source-ai
+
 # Distributed Training & Interactive Inference
 
 This setup provides distributed training across multiple GPUs with periodic checkpointing and interactive text generation.
