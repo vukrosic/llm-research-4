@@ -20,6 +20,7 @@ This setup provides distributed training across multiple GPUs with periodic chec
 - `resume_training.py` - Resume multi-GPU training from checkpoint
 - `resume_single_gpu.py` - Resume single-GPU training from checkpoint
 - `test_checkpoint_loading.py` - Test and diagnose checkpoint loading issues
+- `test_model.py` - Test model functionality and generation
 - `run_distributed.sh` - Launch script for distributed training
 
 ## 🏃‍♂️ Quick Start
@@ -226,6 +227,11 @@ The patient presents with chest pain and shortness of breath. The symptoms began
    - Run: `python test_checkpoint_loading.py` to diagnose
    - The resume scripts now handle PyTorch 2.6+ compatibility automatically
    - If issues persist, try: `python test_checkpoint_loading.py`
+
+5. **Tensor dimension errors during generation**
+   - Run: `python test_model.py` to test model functionality
+   - The interactive inference script now handles tensor shape issues automatically
+   - If issues persist, try: `python test_model.py`
 
 ### Performance Tips
 

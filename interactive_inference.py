@@ -68,12 +68,27 @@ def generate_text(model, tokenizer, prompt, max_length=100, temperature=0.8, top
     input_ids = tokenizer.encode(prompt, add_special_tokens=False, return_tensors="pt")
     input_ids = input_ids.to(next(model.parameters()).device)
     
+    # Ensure input is 2D: [seq_len] -> [1, seq_len]
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+    
     generated = input_ids.clone()
     
+    # Debug info
+    print(f"🔍 Input shape: {input_ids.shape}")
+    print(f"🔍 Generated shape: {generated.shape}")
+    
     with torch.no_grad():
-        for _ in range(max_length):
+        for step in range(max_length):
             # Get model predictions
             outputs = model(generated)
+            
+            # Validate output shape
+            if outputs.dim() != 3:
+                raise ValueError(f"Expected 3D output from model, got {outputs.dim()}D")
+            if outputs.size(0) != 1:
+                raise ValueError(f"Expected batch size 1, got {outputs.size(0)}")
+            
             next_token_logits = outputs[0, -1, :] / temperature
             
             # Apply top-k and top-p filtering
@@ -95,7 +110,13 @@ def generate_text(model, tokenizer, prompt, max_length=100, temperature=0.8, top
             probs = F.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             
+            # Debug tensor shapes (only first few steps to avoid spam)
+            if step < 3:
+                print(f"🔍 Step {step}: Generated shape: {generated.shape}, Next token shape: {next_token.shape}")
+            
             # Append to generated sequence
+            # next_token is [1], we need [1, 1] to concatenate with generated [1, seq_len]
+            next_token = next_token.unsqueeze(1)  # [1] -> [1, 1]
             generated = torch.cat([generated, next_token], dim=1)
             
             # Stop if EOS token is generated
@@ -140,14 +161,19 @@ def interactive_mode(model, tokenizer, device):
             print(f"📝 Prompt: {prompt}")
             
             # Generate text
-            generated_text = generate_text(
-                model, tokenizer, prompt, 
-                max_length=100, temperature=0.8, top_k=50, top_p=0.9
-            )
-            
-            print(f"\n✨ Generated text:")
-            print(f"{generated_text}")
-            print(f"\n" + "="*50)
+            try:
+                generated_text = generate_text(
+                    model, tokenizer, prompt, 
+                    max_length=100, temperature=0.8, top_k=50, top_p=0.9
+                )
+                
+                print(f"\n✨ Generated text:")
+                print(f"{generated_text}")
+                print(f"\n" + "="*50)
+            except Exception as e:
+                print(f"❌ Generation error: {e}")
+                print(f"💡 This might be a model compatibility issue.")
+                print(f"💡 Try a different prompt or check the model checkpoint.")
             
         except KeyboardInterrupt:
             print("\n\n👋 Goodbye!")
@@ -207,6 +233,18 @@ def main():
     print(f"   Architecture: {config.d_model}d, {config.n_layers}L, {config.n_heads}H")
     print(f"   Vocabulary size: {config.vocab_size}")
     print(f"   Max sequence length: {config.max_seq_len}")
+    
+    # Test model with simple input
+    print(f"\n🧪 Testing model with simple input...")
+    try:
+        test_input = torch.tensor([[1, 2, 3]], device=device)  # Simple test sequence
+        with torch.no_grad():
+            test_output = model(test_input)
+        print(f"✅ Model test successful! Output shape: {test_output.shape}")
+    except Exception as e:
+        print(f"❌ Model test failed: {e}")
+        print(f"💡 The model may have compatibility issues.")
+        return
     
     # Start interactive mode
     interactive_mode(model, tokenizer, device)
