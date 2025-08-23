@@ -84,6 +84,9 @@ class ModelConfig:
         # Performance optimization settings
         self.use_triton_rmsnorm: bool = True
         self.use_triton_rotary: bool = True
+        self.use_triton_mlp: bool = True
+        self.use_triton_attention: bool = True
+        self.use_triton_newton_schulz: bool = True
         self.benchmark_kernels: bool = True  # Auto-benchmark and select best
 
 @torch.compile
@@ -393,6 +396,287 @@ class TritonRotary(nn.Module):
             
             return q_rot, k_rot
 
+# ============= ADDITIONAL TRITON KERNELS =============
+
+if TRITON_AVAILABLE:
+    @triton.jit
+    def fused_silu_mul_kernel(
+        X, W1, W3, Y,
+        M, N, K,
+        stride_x, stride_w1, stride_w3, stride_y,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """Fused SiLU gated linear unit: Y = (X @ W1) * silu(X @ W3)"""
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        
+        mask_m = rm < M
+        mask_n = rn < N
+        
+        acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        acc3 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        
+        # Matrix multiplication
+        for k in range(0, K, BLOCK_K):
+            rk = k + tl.arange(0, BLOCK_K)
+            mask_k = rk < K
+            
+            # Load X block
+            x = tl.load(
+                X + rm[:, None] * stride_x + rk[None, :],
+                mask=mask_m[:, None] & mask_k[None, :],
+                other=0.0
+            )
+            
+            # Load W1 and W3 blocks
+            w1 = tl.load(
+                W1 + rk[:, None] * stride_w1 + rn[None, :],
+                mask=mask_k[:, None] & mask_n[None, :],
+                other=0.0
+            )
+            w3 = tl.load(
+                W3 + rk[:, None] * stride_w3 + rn[None, :],
+                mask=mask_k[:, None] & mask_n[None, :],
+                other=0.0
+            )
+            
+            acc1 += tl.dot(x, w1)
+            acc3 += tl.dot(x, w3)
+        
+        # Apply SiLU and gating
+        silu_acc3 = acc3 * tl.sigmoid(acc3)
+        result = acc1 * silu_acc3
+        
+        # Store result
+        tl.store(
+            Y + rm[:, None] * stride_y + rn[None, :],
+            result,
+            mask=mask_m[:, None] & mask_n[None, :],
+        )
+
+    @triton.jit
+    def newton_schulz_kernel(
+        G, X_out,
+        M, N,
+        steps: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Newton-Schulz iteration for orthogonalization"""
+        pid = tl.program_id(0)
+        
+        # Constants from the paper
+        a = 3.4445
+        b = -4.7750
+        c = 2.0315
+        
+        # Initialize X as normalized G
+        norm = tl.zeros((1,), dtype=tl.float32)
+        for i in range(0, M * N, BLOCK_SIZE):
+            idx = i + tl.arange(0, BLOCK_SIZE)
+            mask = idx < M * N
+            g_val = tl.load(G + idx, mask=mask, other=0.0).to(tl.float32)
+            norm += tl.sum(g_val * g_val)
+        
+        norm = tl.sqrt(norm[0] + 1e-7)
+        
+        # Normalize and store initial X
+        for i in range(0, M * N, BLOCK_SIZE):
+            idx = i + tl.arange(0, BLOCK_SIZE)
+            mask = idx < M * N
+            g_val = tl.load(G + idx, mask=mask, other=0.0).to(tl.float32)
+            x_val = g_val / norm
+            tl.store(X_out + idx, x_val, mask=mask)
+
+    @triton.jit
+    def attention_kernel(
+        Q, K, V, O,
+        batch_size, n_heads, seq_len, d_head,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Fused attention kernel with causal masking"""
+        pid = tl.program_id(0)
+        
+        # Calculate offsets
+        batch_head_idx = pid // seq_len
+        seq_idx = pid % seq_len
+        
+        # Load Q, K, V for this position
+        q_offset = batch_head_idx * seq_len * d_head + seq_idx * d_head
+        k_offset = batch_head_idx * seq_len * d_head
+        v_offset = batch_head_idx * seq_len * d_head
+        
+        # Compute attention scores
+        scores = tl.zeros((seq_len,), dtype=tl.float32)
+        
+        for i in range(0, seq_len, BLOCK_SIZE):
+            idx = i + tl.arange(0, BLOCK_SIZE)
+            mask = idx < seq_len
+            
+            # Load K and V
+            k = tl.load(K + k_offset + idx * d_head, mask=mask, other=0.0)
+            v = tl.load(V + v_offset + idx * d_head, mask=mask, other=0.0)
+            
+            # Compute Q @ K^T
+            q = tl.load(Q + q_offset, mask=mask, other=0.0)
+            score = tl.dot(q, k)
+            
+            # Apply causal mask
+            causal_mask = idx <= seq_idx
+            score = tl.where(causal_mask, score, float('-inf'))
+            
+            scores = tl.where(mask, score, scores)
+        
+        # Apply softmax
+        max_score = tl.max(scores)
+        exp_scores = tl.exp(scores - max_score)
+        sum_exp = tl.sum(exp_scores)
+        attention_weights = exp_scores / sum_exp
+        
+        # Compute weighted sum of V
+        output = tl.zeros((d_head,), dtype=tl.float32)
+        for i in range(0, seq_len, BLOCK_SIZE):
+            idx = i + tl.arange(0, BLOCK_SIZE)
+            mask = idx < seq_len
+            
+            v = tl.load(V + v_offset + idx * d_head, mask=mask, other=0.0)
+            weight = tl.load(attention_weights + idx, mask=mask, other=0.0)
+            
+            output += weight * v
+        
+        # Store output
+        o_offset = batch_head_idx * seq_len * d_head + seq_idx * d_head
+        tl.store(O + o_offset, output)
+
+# ============= ADDITIONAL PYTORCH INTEGRATION =============
+
+class TritonGatedMLP(nn.Module):
+    """Fused SiLU-gated MLP using Triton"""
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.w1 = nn.Parameter(torch.randn(d_model, d_ff) * 0.02)
+        self.w2 = nn.Parameter(torch.randn(d_ff, d_model) * 0.02)
+        self.w3 = nn.Parameter(torch.randn(d_model, d_ff) * 0.02)
+    
+    def forward(self, x):
+        if TRITON_AVAILABLE:
+            B, T, D = x.shape
+            x_flat = x.view(B * T, D)
+            
+            # Ensure weight dtypes match input
+            w1 = self.w1.to(x.dtype) if self.w1.dtype != x.dtype else self.w1
+            w2 = self.w2.to(x.dtype) if self.w2.dtype != x.dtype else self.w2
+            w3 = self.w3.to(x.dtype) if self.w3.dtype != x.dtype else self.w3
+            
+            # Intermediate output
+            intermediate = torch.empty(B * T, w1.shape[1], device=x.device, dtype=x.dtype)
+            
+            # Grid and block sizes
+            M, K = x_flat.shape
+            N = w1.shape[1]
+            
+            BLOCK_M = 32
+            BLOCK_N = 64
+            BLOCK_K = 32
+            
+            grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+            
+            # Fused gate computation
+            fused_silu_mul_kernel[grid](
+                x_flat, w1, w3, intermediate,
+                M, N, K,
+                x_flat.stride(0), w1.stride(0), w3.stride(0), intermediate.stride(0),
+                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            )
+            
+            # Final projection
+            output = F.linear(intermediate, w2.t())
+            return output.view(B, T, -1)
+        else:
+            # Fallback to PyTorch implementation
+            return F.linear(F.silu(F.linear(x, self.w1)) * F.linear(x, self.w3), self.w2.t())
+
+def zeropower_via_triton(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
+    """Newton-Schulz using Triton kernel"""
+    if not TRITON_AVAILABLE:
+        # Fallback to PyTorch implementation
+        return zeropower_via_newtonschulz5(G)
+    
+    assert G.is_cuda
+    orig_shape = G.shape
+    G = G.reshape(-1)
+    
+    X = torch.empty_like(G)
+    M, N = orig_shape[-2], orig_shape[-1] if len(orig_shape) > 1 else 1, G.shape[0]
+    
+    BLOCK_SIZE = 1024
+    grid = (1,)
+    
+    newton_schulz_kernel[grid](
+        G, X,
+        M, N,
+        steps=steps,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return X.reshape(orig_shape)
+
+class TritonAttention(nn.Module):
+    """Fused attention using Triton"""
+    def __init__(self, d_model: int, n_heads: int, max_seq_len: int, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_k = d_model // n_heads
+        self.dropout = dropout
+
+        self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
+        self.w_o = nn.Linear(d_model, d_model, bias=False)
+        self.rotary = TritonRotary(self.d_k, max_seq_len)
+    
+    def forward(self, x):
+        if TRITON_AVAILABLE:
+            batch_size, seq_len = x.size(0), x.size(1)
+
+            qkv = self.qkv(x).reshape(batch_size, seq_len, 3, self.n_heads, self.d_k)
+            qkv = qkv.permute(2, 0, 3, 1, 4)
+            Q, K, V = qkv[0], qkv[1], qkv[2]
+
+            Q, K = self.rotary(Q, K)
+
+            # Apply Triton attention kernel
+            output = torch.empty_like(Q)
+            grid = (batch_size * self.n_heads * seq_len,)
+            BLOCK_SIZE = 64
+            
+            attention_kernel[grid](
+                Q, K, V, output,
+                batch_size, self.n_heads, seq_len, self.d_k,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
+            
+            output = output.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)
+            return self.w_o(output)
+        else:
+            # Fallback to PyTorch implementation
+            batch_size, seq_len = x.size(0), x.size(1)
+
+            qkv = self.qkv(x).reshape(batch_size, seq_len, 3, self.n_heads, self.d_k)
+            qkv = qkv.permute(2, 0, 3, 1, 4)
+            Q, K, V = qkv[0], qkv[1], qkv[2]
+
+            Q, K = self.rotary(Q, K)
+
+            attn_output = F.scaled_dot_product_attention(
+                Q, K, V, is_causal=True, dropout_p=self.dropout if self.training else 0.0
+            )
+            attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)
+            return self.w_o(attn_output)
+
 class Muon(torch.optim.Optimizer):
     """Muon - MomentUm Orthogonalized by Newton-schulz"""
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
@@ -415,7 +699,13 @@ class Muon(torch.optim.Optimizer):
                 buf = state["momentum_buffer"]
                 buf.lerp_(g, 1 - group["momentum"])
                 g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
-                g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                
+                # Use Triton kernel if available and selected
+                if hasattr(self, 'config') and getattr(self.config, 'use_triton_newton_schulz', False) and TRITON_AVAILABLE:
+                    g = zeropower_via_triton(g, steps=group["ns_steps"])
+                else:
+                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                    
                 p.add_(g.view_as(p), alpha=-group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5)
 	
 def load_and_cache_data(config: ModelConfig, cache_dir: str = "data_cache"):
@@ -576,10 +866,21 @@ class FeedForward(nn.Module):
         return self.linear2(self.dropout(F.silu(self.linear1(x))))
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, max_seq_len: int, dropout: float = 0.1, use_triton_rmsnorm: bool = False):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, max_seq_len: int, dropout: float = 0.1, 
+                 use_triton_rmsnorm: bool = False, use_triton_attention: bool = False, use_triton_mlp: bool = False):
         super().__init__()
-        self.attention = MultiHeadAttention(d_model, n_heads, max_seq_len, dropout, use_triton_rotary=use_triton_rmsnorm)
-        self.feed_forward = FeedForward(d_model, d_ff, dropout)
+        
+        # Choose attention implementation
+        if use_triton_attention and TRITON_AVAILABLE:
+            self.attention = TritonAttention(d_model, n_heads, max_seq_len, dropout)
+        else:
+            self.attention = MultiHeadAttention(d_model, n_heads, max_seq_len, dropout, use_triton_rotary=use_triton_rmsnorm)
+        
+        # Choose MLP implementation
+        if use_triton_mlp and TRITON_AVAILABLE:
+            self.feed_forward = TritonGatedMLP(d_model, d_ff)
+        else:
+            self.feed_forward = FeedForward(d_model, d_ff, dropout)
         
         # Choose RMSNorm implementation based on performance
         if use_triton_rmsnorm and TRITON_AVAILABLE:
@@ -609,7 +910,9 @@ class MinimalLLM(nn.Module):
         self.transformer_blocks = nn.ModuleList([
             TransformerBlock(
                 config.d_model, config.n_heads, config.d_ff, config.max_seq_len, config.dropout,
-                use_triton_rmsnorm=config.use_triton_rmsnorm
+                use_triton_rmsnorm=config.use_triton_rmsnorm,
+                use_triton_attention=config.use_triton_attention,
+                use_triton_mlp=config.use_triton_mlp
             )
             for _ in range(config.n_layers)
         ])
@@ -790,12 +1093,171 @@ def benchmark_rotary(batch_size: int, seq_len: int, n_heads: int, d_head: int, n
             'use_triton': False
         }
 
+def benchmark_mlp(batch_size: int, seq_len: int, d_model: int, d_ff: int, num_runs: int = 50) -> Dict[str, float]:
+    """Benchmark MLP implementations"""
+    device = torch.device('cuda')
+    
+    # Create test data
+    x = torch.randn(batch_size, seq_len, d_model, device=device, dtype=torch.float16)
+    
+    # PyTorch FeedForward
+    pytorch_mlp = FeedForward(d_model, d_ff).to(device, dtype=torch.float16)
+    
+    # Warmup
+    for _ in range(10):
+        _ = pytorch_mlp(x)
+    
+    torch.cuda.synchronize()
+    
+    # Benchmark PyTorch
+    start_time = time.time()
+    for _ in range(num_runs):
+        _ = pytorch_mlp(x)
+    torch.cuda.synchronize()
+    pytorch_time = time.time() - start_time
+    
+    if TRITON_AVAILABLE:
+        # Triton GatedMLP
+        triton_mlp = TritonGatedMLP(d_model, d_ff).to(device, dtype=torch.float16)
+        
+        # Warmup
+        for _ in range(10):
+            _ = triton_mlp(x)
+        
+        torch.cuda.synchronize()
+        
+        # Benchmark Triton
+        start_time = time.time()
+        for _ in range(num_runs):
+            _ = triton_mlp(x)
+        torch.cuda.synchronize()
+        triton_time = time.time() - start_time
+        
+        return {
+            'pytorch_time': pytorch_time / num_runs * 1000,
+            'triton_time': triton_time / num_runs * 1000,
+            'speedup': pytorch_time / triton_time,
+            'use_triton': triton_time < pytorch_time
+        }
+    else:
+        return {
+            'pytorch_time': pytorch_time / num_runs * 1000,
+            'triton_time': float('inf'),
+            'speedup': 1.0,
+            'use_triton': False
+        }
+
+def benchmark_attention(batch_size: int, seq_len: int, d_model: int, n_heads: int, num_runs: int = 50) -> Dict[str, float]:
+    """Benchmark Attention implementations"""
+    device = torch.device('cuda')
+    
+    # Create test data
+    x = torch.randn(batch_size, seq_len, d_model, device=device, dtype=torch.float16)
+    
+    # PyTorch MultiHeadAttention
+    pytorch_attention = MultiHeadAttention(d_model, n_heads, seq_len).to(device)
+    
+    # Warmup
+    for _ in range(10):
+        _ = pytorch_attention(x)
+    
+    torch.cuda.synchronize()
+    
+    # Benchmark PyTorch
+    start_time = time.time()
+    for _ in range(num_runs):
+        _ = pytorch_attention(x)
+    torch.cuda.synchronize()
+    pytorch_time = time.time() - start_time
+    
+    if TRITON_AVAILABLE:
+        # Triton Attention
+        triton_attention = TritonAttention(d_model, n_heads, seq_len).to(device)
+        
+        # Warmup
+        for _ in range(10):
+            _ = triton_attention(x)
+        
+        torch.cuda.synchronize()
+        
+        # Benchmark Triton
+        start_time = time.time()
+        for _ in range(num_runs):
+            _ = triton_attention(x)
+        torch.cuda.synchronize()
+        triton_time = time.time() - start_time
+        
+        return {
+            'pytorch_time': pytorch_time / num_runs * 1000,
+            'triton_time': triton_time / num_runs * 1000,
+            'speedup': pytorch_time / triton_time,
+            'use_triton': triton_time < pytorch_time
+        }
+    else:
+        return {
+            'pytorch_time': pytorch_time / num_runs * 1000,
+            'triton_time': float('inf'),
+            'speedup': 1.0,
+            'use_triton': False
+        }
+
+def benchmark_newton_schulz(matrix_size: int, num_runs: int = 50) -> Dict[str, float]:
+    """Benchmark Newton-Schulz implementations"""
+    device = torch.device('cuda')
+    
+    # Create test data
+    G = torch.randn(matrix_size, matrix_size, device=device, dtype=torch.float16)
+    
+    # Warmup
+    for _ in range(10):
+        _ = zeropower_via_newtonschulz5(G)
+    
+    torch.cuda.synchronize()
+    
+    # Benchmark PyTorch
+    start_time = time.time()
+    for _ in range(num_runs):
+        _ = zeropower_via_newtonschulz5(G)
+    torch.cuda.synchronize()
+    pytorch_time = time.time() - start_time
+    
+    if TRITON_AVAILABLE:
+        # Warmup
+        for _ in range(10):
+            _ = zeropower_via_triton(G)
+        
+        torch.cuda.synchronize()
+        
+        # Benchmark Triton
+        start_time = time.time()
+        for _ in range(num_runs):
+            _ = zeropower_via_triton(G)
+        torch.cuda.synchronize()
+        triton_time = time.time() - start_time
+        
+        return {
+            'pytorch_time': pytorch_time / num_runs * 1000,
+            'triton_time': triton_time / num_runs * 1000,
+            'speedup': pytorch_time / triton_time,
+            'use_triton': triton_time < pytorch_time
+        }
+    else:
+        return {
+            'pytorch_time': pytorch_time / num_runs * 1000,
+            'triton_time': float('inf'),
+            'speedup': 1.0,
+            'use_triton': False
+        }
+
 def auto_select_kernels(config: ModelConfig) -> Dict[str, bool]:
     """Automatically benchmark and select the best kernels for the current configuration"""
     if not config.benchmark_kernels or not TRITON_AVAILABLE:
         return {
             'use_triton_rmsnorm': False,
-            'use_triton_rotary': False
+            'use_triton_rotary': False,
+            'use_triton_mlp': False,
+            'use_triton_attention': False,
+            'use_triton_newton_schulz': False
         }
     
     print("🔍 Auto-benchmarking kernels for optimal performance...")
@@ -806,6 +1268,7 @@ def auto_select_kernels(config: ModelConfig) -> Dict[str, bool]:
     d_model = config.d_model
     n_heads = config.n_heads
     d_head = d_model // n_heads
+    d_ff = config.d_ff
     
     print(f"  Testing with: batch_size={batch_size}, seq_len={seq_len}, d_model={d_model}")
     
@@ -827,13 +1290,47 @@ def auto_select_kernels(config: ModelConfig) -> Dict[str, bool]:
         print(f"    Speedup: {rotary_results['speedup']:.2f}x")
         print(f"    Using:   {'Triton' if rotary_results['use_triton'] else 'PyTorch'}")
     
+    # Benchmark MLP
+    print("  Benchmarking MLP...")
+    mlp_results = benchmark_mlp(batch_size, seq_len, d_model, d_ff)
+    print(f"    PyTorch: {mlp_results['pytorch_time']:.3f} ms")
+    if TRITON_AVAILABLE:
+        print(f"    Triton:  {mlp_results['triton_time']:.3f} ms")
+        print(f"    Speedup: {mlp_results['speedup']:.2f}x")
+        print(f"    Using:   {'Triton' if mlp_results['use_triton'] else 'PyTorch'}")
+    
+    # Benchmark Attention
+    print("  Benchmarking Attention...")
+    attention_results = benchmark_attention(batch_size, seq_len, d_model, n_heads)
+    print(f"    PyTorch: {attention_results['pytorch_time']:.3f} ms")
+    if TRITON_AVAILABLE:
+        print(f"    Triton:  {attention_results['triton_time']:.3f} ms")
+        print(f"    Speedup: {attention_results['speedup']:.2f}x")
+        print(f"    Using:   {'Triton' if attention_results['use_triton'] else 'PyTorch'}")
+    
+    # Benchmark Newton-Schulz
+    print("  Benchmarking Newton-Schulz...")
+    matrix_size = min(256, d_model)  # Use reasonable matrix size
+    ns_results = benchmark_newton_schulz(matrix_size)
+    print(f"    PyTorch: {ns_results['pytorch_time']:.3f} ms")
+    if TRITON_AVAILABLE:
+        print(f"    Triton:  {ns_results['triton_time']:.3f} ms")
+        print(f"    Speedup: {ns_results['speedup']:.2f}x")
+        print(f"    Using:   {'Triton' if ns_results['use_triton'] else 'PyTorch'}")
+    
     # Update config with best choices
     config.use_triton_rmsnorm = rms_results['use_triton']
     config.use_triton_rotary = rotary_results['use_triton']
+    config.use_triton_mlp = mlp_results['use_triton']
+    config.use_triton_attention = attention_results['use_triton']
+    config.use_triton_newton_schulz = ns_results['use_triton']
     
     return {
         'use_triton_rmsnorm': rms_results['use_triton'],
-        'use_triton_rotary': rotary_results['use_triton']
+        'use_triton_rotary': rotary_results['use_triton'],
+        'use_triton_mlp': mlp_results['use_triton'],
+        'use_triton_attention': attention_results['use_triton'],
+        'use_triton_newton_schulz': ns_results['use_triton']
     }
 
 def setup_muon_optimizer(model: nn.Module, config: ModelConfig):
@@ -891,7 +1388,12 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
     # Auto-select best kernels based on performance
     if config.benchmark_kernels:
         kernel_selection = auto_select_kernels(config)
-        print(f"  🚀 Kernel selection: RMSNorm={'Triton' if kernel_selection['use_triton_rmsnorm'] else 'PyTorch'}, Rotary={'Triton' if kernel_selection['use_triton_rotary'] else 'PyTorch'}")
+        print(f"  🚀 Kernel selection:")
+        print(f"    RMSNorm: {'Triton' if kernel_selection['use_triton_rmsnorm'] else 'PyTorch'}")
+        print(f"    Rotary:  {'Triton' if kernel_selection['use_triton_rotary'] else 'PyTorch'}")
+        print(f"    MLP:     {'Triton' if kernel_selection['use_triton_mlp'] else 'PyTorch'}")
+        print(f"    Attention: {'Triton' if kernel_selection['use_triton_attention'] else 'PyTorch'}")
+        print(f"    Newton-Schulz: {'Triton' if kernel_selection['use_triton_newton_schulz'] else 'PyTorch'}")
     
     model = MinimalLLM(config)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -908,6 +1410,9 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
     if config.benchmark_kernels:
         wandb.run.summary["use_triton_rmsnorm"] = config.use_triton_rmsnorm
         wandb.run.summary["use_triton_rotary"] = config.use_triton_rotary
+        wandb.run.summary["use_triton_mlp"] = config.use_triton_mlp
+        wandb.run.summary["use_triton_attention"] = config.use_triton_attention
+        wandb.run.summary["use_triton_newton_schulz"] = config.use_triton_newton_schulz
 
     # Setup optimizers
     optimizers = setup_muon_optimizer(model, config)
