@@ -6,6 +6,7 @@ This setup provides distributed training across multiple GPUs with periodic chec
 
 - **Distributed Training**: Train on multiple GPUs using PyTorch DDP
 - **Periodic Checkpointing**: Save model every 500 steps automatically
+- **Resume Training**: Continue from any checkpoint with flexible GPU configuration
 - **Interactive Inference**: Chat with your trained model
 - **Centralized Data**: Single data loading server for all GPUs
 - **Checkpoint Management**: Easy checkpoint listing and loading
@@ -16,6 +17,8 @@ This setup provides distributed training across multiple GPUs with periodic chec
 - `data_server.py` - Centralized data loading and caching
 - `interactive_inference.py` - Interactive text generation
 - `list_checkpoints.py` - List available checkpoints
+- `resume_training.py` - Resume multi-GPU training from checkpoint
+- `resume_single_gpu.py` - Resume single-GPU training from checkpoint
 - `run_distributed.sh` - Launch script for distributed training
 
 ## 🏃‍♂️ Quick Start
@@ -43,7 +46,26 @@ python distributed_train.py
 python list_checkpoints.py
 ```
 
-### 3. Start Interactive Inference
+### 3. Resume Training from Checkpoint
+
+```bash
+# Resume multi-GPU training (auto-finds latest checkpoint)
+python resume_training.py
+
+# Resume with specific GPU count
+python resume_training.py --gpus 4
+
+# Resume with custom parameters
+python resume_training.py --max-steps 2000 --batch-size 64
+
+# Resume single-GPU training
+python resume_single_gpu.py
+
+# List available checkpoints
+python list_checkpoints.py
+```
+
+### 4. Start Interactive Inference
 
 ```bash
 # Use latest checkpoint (recommended)
@@ -86,6 +108,59 @@ if rank == 0 and step % 500 == 0:
 3. **Data Distribution**: Each GPU gets different batches via DistributedSampler
 4. **Gradient Sync**: Gradients automatically averaged across GPUs
 5. **Checkpointing**: Model saved every 500 steps to `checkpoints/` directory
+
+## 🔄 Resume Training
+
+### Multi-GPU Resume
+
+```bash
+# Resume with all available GPUs
+python resume_training.py
+
+# Resume with specific number of GPUs
+python resume_training.py --gpus 4
+
+# Resume with custom training length
+python resume_training.py --max-steps 2000
+
+# Resume with different batch size
+python resume_training.py --batch-size 64
+```
+
+### Single-GPU Resume
+
+```bash
+# Resume on single GPU
+python resume_single_gpu.py
+
+# Resume with custom parameters
+python resume_single_gpu.py --max-steps 2000 --batch-size 32
+```
+
+### Resume Features
+
+- **Automatic checkpoint detection**: Finds latest checkpoint automatically
+- **Flexible GPU configuration**: Change number of GPUs between runs
+- **Parameter override**: Modify batch size, max steps, etc.
+- **Optimizer state preservation**: Continues with exact training state
+- **Training history tracking**: Records which checkpoint was resumed from
+
+### Changing GPU Configuration
+
+You can resume training with a different number of GPUs:
+
+```bash
+# Train on 4 GPUs initially
+python distributed_train.py
+
+# Later resume on 2 GPUs
+python resume_training.py --gpus 2
+
+# Or resume on single GPU
+python resume_single_gpu.py
+```
+
+**Note**: The model architecture and weights are preserved, only the distributed setup changes.
 
 ## 🎭 Interactive Inference
 
@@ -170,9 +245,10 @@ The patient presents with chest pain and shortness of breath. The symptoms began
 
 1. **Train your model**: `python distributed_train.py`
 2. **Monitor progress**: Check `checkpoints/` directory
-3. **Test generation**: `python interactive_inference.py`
-4. **Fine-tune**: Adjust hyperparameters in `ModelConfig`
-5. **Scale up**: Increase model size or training steps
+3. **Resume training**: `python resume_training.py` (multi-GPU) or `python resume_single_gpu.py` (single-GPU)
+4. **Test generation**: `python interactive_inference.py`
+5. **Fine-tune**: Adjust hyperparameters in `ModelConfig`
+6. **Scale up**: Increase model size or training steps
 
 ## 📚 Advanced Usage
 
