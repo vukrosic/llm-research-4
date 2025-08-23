@@ -110,6 +110,7 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5) -> torch.Tensor
 
 # ============= TRITON KERNELS =============
 
+# Define Triton kernels and classes conditionally
 if TRITON_AVAILABLE:
     @triton.jit
     def rms_norm_fwd_kernel(
@@ -315,6 +316,82 @@ if TRITON_AVAILABLE:
             k = k.reshape(batch_size, n_heads, seq_len, d_head)
             
             return q, k
+
+# ============= PYTORCH INTEGRATION =============
+
+# Define wrapper classes that work whether Triton is available or not
+class TritonRMSNormLayer(nn.Module):
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+    
+    def forward(self, x):
+        if TRITON_AVAILABLE:
+            orig_shape = x.shape
+            x = x.view(-1, orig_shape[-1])
+            
+            # Ensure weight dtype matches input
+            if self.weight.dtype != x.dtype:
+                weight = self.weight.to(x.dtype)
+            else:
+                weight = self.weight
+                
+            x = TritonRMSNorm.apply(x, weight, self.eps)
+            return x.view(orig_shape)
+        else:
+            # Fallback to PyTorch RMSNorm
+            return F.layer_norm(x, (x.shape[-1],), self.weight, None, self.eps)
+
+class TritonRotary(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int):
+        super().__init__()
+        self.dim = dim
+        
+        # Precompute cos and sin
+        angular_freq = (1 / 10000) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        theta = torch.einsum("i,j -> ij", t, angular_freq)
+        self.register_buffer('cos', theta.cos(), persistent=False)
+        self.register_buffer('sin', theta.sin(), persistent=False)
+    
+    def forward(self, q, k):
+        if TRITON_AVAILABLE:
+            batch_size, n_heads, seq_len, d_head = q.shape
+            
+            # Reshape for kernel
+            q = q.reshape(batch_size * n_heads, seq_len, d_head)
+            k = k.reshape(batch_size * n_heads, seq_len, d_head)
+            
+            # Apply rotary embeddings
+            grid = (batch_size * n_heads, seq_len)
+            BLOCK_SIZE = triton.next_power_of_2(d_head // 2)
+            
+            rotary_kernel[grid](
+                q, k,
+                self.cos, self.sin,
+                seq_len, d_head,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
+            
+            # Reshape back
+            q = q.reshape(batch_size, n_heads, seq_len, d_head)
+            k = k.reshape(batch_size, n_heads, seq_len, d_head)
+            
+            return q, k
+        else:
+            # Fallback to PyTorch implementation
+            batch_size, n_heads, seq_len, d_head = q.shape
+            cos = self.cos[:seq_len, :d_head//2].unsqueeze(0).unsqueeze(2)
+            sin = self.sin[:seq_len, :d_head//2].unsqueeze(0).unsqueeze(2)
+            
+            q1, q2 = q.chunk(2, dim=-1)
+            k1, k2 = k.chunk(2, dim=-1)
+            
+            q_rot = torch.cat([q1 * cos - q2 * sin, q1 * sin + q2 * cos], dim=-1)
+            k_rot = torch.cat([k1 * cos - k2 * sin, k1 * sin + k2 * cos], dim=-1)
+            
+            return q_rot, k_rot
 
 class Muon(torch.optim.Optimizer):
     """Muon - MomentUm Orthogonalized by Newton-schulz"""
