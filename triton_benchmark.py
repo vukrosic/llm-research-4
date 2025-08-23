@@ -22,24 +22,24 @@ def rms_norm_fwd_kernel(
     eps: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Fused RMSNorm forward kernel"""
+    """Fused RMSNorm forward kernel - optimized version"""
     row = tl.program_id(0)
     X += row * stride
     Y += row * stride
     
-    # Compute variance
-    _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    # Compute variance in a single pass with better memory access
+    var = 0.0
     for off in range(0, N, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < N
         x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
-        _var += x * x
+        var += tl.sum(x * x, axis=0)
     
-    var = tl.sum(_var, axis=0) / N
+    var = var / N
     rstd_val = 1 / tl.sqrt(var + eps)
     tl.store(rstd + row, rstd_val)
     
-    # Normalize and apply weight
+    # Normalize and apply weight in a single pass
     for off in range(0, N, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < N
@@ -100,7 +100,8 @@ class TritonRMSNorm(torch.autograd.Function):
         y = torch.empty_like(x)
         rstd = torch.empty(M, dtype=torch.float32, device=x.device)
         
-        BLOCK_SIZE = triton.next_power_of_2(N)
+        # Use larger block size for better GPU utilization
+        BLOCK_SIZE = min(1024, triton.next_power_of_2(N))
         grid = (M,)
         
         rms_norm_fwd_kernel[grid](
@@ -283,7 +284,14 @@ class TritonRMSNormLayer(nn.Module):
     def forward(self, x):
         orig_shape = x.shape
         x = x.view(-1, orig_shape[-1])
-        x = TritonRMSNorm.apply(x, self.weight, self.eps)
+        
+        # Ensure weight dtype matches input
+        if self.weight.dtype != x.dtype:
+            weight = self.weight.to(x.dtype)
+        else:
+            weight = self.weight
+            
+        x = TritonRMSNorm.apply(x, weight, self.eps)
         return x.view(orig_shape)
 
 class TritonRotary(nn.Module):
@@ -334,12 +342,17 @@ class TritonGatedMLP(nn.Module):
         B, T, D = x.shape
         x_flat = x.view(B * T, D)
         
+        # Ensure weight dtypes match input
+        w1 = self.w1.to(x.dtype) if self.w1.dtype != x.dtype else self.w1
+        w2 = self.w2.to(x.dtype) if self.w2.dtype != x.dtype else self.w2
+        w3 = self.w3.to(x.dtype) if self.w3.dtype != x.dtype else self.w3
+        
         # Intermediate output
-        intermediate = torch.empty(B * T, self.w1.shape[1], device=x.device, dtype=x.dtype)
+        intermediate = torch.empty(B * T, w1.shape[1], device=x.device, dtype=x.dtype)
         
         # Grid and block sizes
         M, K = x_flat.shape
-        N = self.w1.shape[1]
+        N = w1.shape[1]
         
         BLOCK_M = 32
         BLOCK_N = 64
@@ -349,14 +362,14 @@ class TritonGatedMLP(nn.Module):
         
         # Fused gate computation
         fused_silu_mul_kernel[grid](
-            x_flat, self.w1, self.w3, intermediate,
+            x_flat, w1, w3, intermediate,
             M, N, K,
-            x_flat.stride(0), self.w1.stride(0), self.w3.stride(0), intermediate.stride(0),
+            x_flat.stride(0), w1.stride(0), w3.stride(0), intermediate.stride(0),
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
         )
         
         # Final projection
-        output = F.linear(intermediate, self.w2.t())
+        output = F.linear(intermediate, w2.t())
         return output.view(B, T, -1)
 
 def zeropower_via_triton(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
@@ -431,6 +444,13 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.linear2(self.dropout(F.silu(self.linear1(x))))
+    
+    def to(self, device=None, dtype=None, non_blocking=False):
+        # Ensure weights match input dtype
+        if dtype is not None:
+            self.linear1.weight.data = self.linear1.weight.data.to(dtype)
+            self.linear2.weight.data = self.linear2.weight.data.to(dtype)
+        return super().to(device, dtype, non_blocking)
 
 # ============= BENCHMARKING FUNCTIONS =============
 
@@ -443,13 +463,14 @@ def benchmark_rms_norm(batch_size: int, seq_len: int, d_model: int, num_runs: in
     weight = torch.ones(d_model, device=device, dtype=torch.float16)
     
     # PyTorch RMSNorm
-    pytorch_norm = nn.RMSNorm(d_model).to(device)
+    pytorch_norm = nn.RMSNorm(d_model).to(device, dtype=torch.float16)
     
     # Triton RMSNorm
-    triton_norm = TritonRMSNormLayer(d_model).to(device)
+    triton_norm = TritonRMSNormLayer(d_model).to(device, dtype=torch.float16)
     
-    # Warmup
-    for _ in range(10):
+    # Extended warmup to ensure kernels are compiled
+    print("    Warming up kernels...")
+    for _ in range(20):
         _ = pytorch_norm(x)
         _ = triton_norm(x)
     
@@ -524,10 +545,10 @@ def benchmark_mlp(batch_size: int, seq_len: int, d_model: int, d_ff: int, num_ru
     x = torch.randn(batch_size, seq_len, d_model, device=device, dtype=torch.float16)
     
     # PyTorch FeedForward
-    pytorch_mlp = FeedForward(d_model, d_ff).to(device)
+    pytorch_mlp = FeedForward(d_model, d_ff).to(device, dtype=torch.float16)
     
     # Triton GatedMLP
-    triton_mlp = TritonGatedMLP(d_model, d_ff).to(device)
+    triton_mlp = TritonGatedMLP(d_model, d_ff).to(device, dtype=torch.float16)
     
     # Warmup
     for _ in range(10):
@@ -606,42 +627,55 @@ def run_comprehensive_benchmark():
         print(f"\n�� Configuration {i+1}: {config['batch_size']}x{config['seq_len']}x{config['d_model']}")
         print("-" * 50)
         
-        # RMSNorm benchmark
-        rms_results = benchmark_rms_norm(
-            config['batch_size'], config['seq_len'], config['d_model']
-        )
-        print(f"RMSNorm:")
-        print(f"  PyTorch: {rms_results['pytorch_time']:.3f} ms")
-        print(f"  Triton:  {rms_results['triton_time']:.3f} ms")
-        print(f"  Speedup: {rms_results['speedup']:.2f}x")
-        
-        # Rotary benchmark
-        rotary_results = benchmark_rotary(
-            config['batch_size'], config['seq_len'], config['n_heads'], config['d_model'] // config['n_heads']
-        )
-        print(f"Rotary:")
-        print(f"  PyTorch: {rotary_results['pytorch_time']:.3f} ms")
-        print(f"  Triton:  {rotary_results['triton_time']:.3f} ms")
-        print(f"  Speedup: {rotary_results['speedup']:.2f}x")
-        
-        # MLP benchmark
-        mlp_results = benchmark_mlp(
-            config['batch_size'], config['seq_len'], config['d_model'], config['d_ff']
-        )
-        print(f"MLP:")
-        print(f"  PyTorch: {mlp_results['pytorch_time']:.3f} ms")
-        print(f"  Triton:  {mlp_results['triton_time']:.3f} ms")
-        print(f"  Speedup: {mlp_results['speedup']:.2f}x")
+        try:
+            # RMSNorm benchmark
+            print("  Testing RMSNorm...")
+            rms_results = benchmark_rms_norm(
+                config['batch_size'], config['seq_len'], config['d_model']
+            )
+            print(f"  RMSNorm:")
+            print(f"    PyTorch: {rms_results['pytorch_time']:.3f} ms")
+            print(f"    Triton:  {rms_results['triton_time']:.3f} ms")
+            print(f"    Speedup: {rms_results['speedup']:.2f}x")
+            
+            # Rotary benchmark
+            print("  Testing Rotary...")
+            rotary_results = benchmark_rotary(
+                config['batch_size'], config['seq_len'], config['n_heads'], config['d_model'] // config['n_heads']
+            )
+            print(f"  Rotary:")
+            print(f"    PyTorch: {rotary_results['pytorch_time']:.3f} ms")
+            print(f"    Triton:  {rotary_results['triton_time']:.3f} ms")
+            print(f"    Speedup: {rotary_results['speedup']:.2f}x")
+            
+            # MLP benchmark
+            print("  Testing MLP...")
+            mlp_results = benchmark_mlp(
+                config['batch_size'], config['seq_len'], config['d_model'], config['d_ff']
+            )
+            print(f"  MLP:")
+            print(f"    PyTorch: {mlp_results['pytorch_time']:.3f} ms")
+            print(f"    Triton:  {mlp_results['triton_time']:.3f} ms")
+            print(f"    Speedup: {mlp_results['speedup']:.2f}x")
+            
+        except Exception as e:
+            print(f"  ❌ Error in configuration {i+1}: {e}")
+            continue
     
     # Newton-Schulz benchmark
     print(f"\n�� Newton-Schulz Orthogonalization")
     print("-" * 50)
     for matrix_size in [128, 256, 512]:
-        ns_results = benchmark_newton_schulz(matrix_size)
-        print(f"Matrix {matrix_size}x{matrix_size}:")
-        print(f"  PyTorch: {ns_results['pytorch_time']:.3f} ms")
-        print(f"  Triton:  {ns_results['triton_time']:.3f} ms")
-        print(f"  Speedup: {ns_results['speedup']:.2f}x")
+        try:
+            print(f"  Testing {matrix_size}x{matrix_size}...")
+            ns_results = benchmark_newton_schulz(matrix_size)
+            print(f"  Matrix {matrix_size}x{matrix_size}:")
+            print(f"    PyTorch: {ns_results['pytorch_time']:.3f} ms")
+            print(f"    Triton:  {ns_results['triton_time']:.3f} ms")
+            print(f"    Speedup: {ns_results['speedup']:.2f}x")
+        except Exception as e:
+            print(f"  ❌ Error in Newton-Schulz {matrix_size}: {e}")
+            continue
     
     print(f"\n✅ Benchmark completed!")
 
@@ -661,7 +695,7 @@ def run_memory_efficiency_test():
     torch.cuda.reset_peak_memory_stats()
     
     # PyTorch RMSNorm
-    pytorch_norm = nn.RMSNorm(d_model).to(device)
+    pytorch_norm = nn.RMSNorm(d_model).to(device, dtype=torch.float16)
     _ = pytorch_norm(x)
     pytorch_memory = torch.cuda.max_memory_allocated() / 1024**2  # MB
     
@@ -669,7 +703,7 @@ def run_memory_efficiency_test():
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     
-    triton_norm = TritonRMSNormLayer(d_model).to(device)
+    triton_norm = TritonRMSNormLayer(d_model).to(device, dtype=torch.float16)
     _ = triton_norm(x)
     triton_memory = torch.cuda.max_memory_allocated() / 1024**2  # MB
     
