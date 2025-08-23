@@ -36,7 +36,14 @@ def load_model_from_checkpoint(checkpoint_path, device):
     """Load model from checkpoint"""
     print(f"🔄 Loading model from {checkpoint_path}")
     
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    try:
+        # Try loading with weights_only=False for PyTorch 2.6+ compatibility
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except Exception as e:
+        print(f"⚠️ Standard loading failed: {e}")
+        print("🔄 Trying with weights_only=False for PyTorch 2.6+ compatibility...")
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    
     config = checkpoint['config']
     model_state_dict = checkpoint['model_state_dict']
     
@@ -187,7 +194,13 @@ def main():
     tokenizer = data['tokenizer']
     
     # Load model
-    model, config = load_model_from_checkpoint(checkpoint_path, device)
+    try:
+        model, config = load_model_from_checkpoint(checkpoint_path, device)
+    except Exception as e:
+        print(f"❌ Error loading checkpoint: {e}")
+        print("💡 This might be a PyTorch 2.6+ compatibility issue.")
+        print("💡 Try updating the checkpoint loading code or use an older PyTorch version.")
+        return
     
     # Print model info
     print(f"\n📊 Model Information:")

@@ -136,7 +136,7 @@ def train_worker(rank, world_size, config):
                     'optimizer_states': [opt.state_dict() for opt in optimizers],
                     'config': config,
                     'loss': loss.item(),
-                }, checkpoint_path)
+                }, checkpoint_path, _use_new_zipfile_serialization=False)
                 print(f"💾 Saved checkpoint to {checkpoint_path}")
     
     if rank == 0:

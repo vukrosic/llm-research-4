@@ -37,7 +37,12 @@ def resume_single_gpu(checkpoint_path, resume_config):
     
     # Load checkpoint
     print(f"🔄 Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except Exception as e:
+        print(f"⚠️ Standard loading failed: {e}")
+        print("🔄 Trying with weights_only=False for PyTorch 2.6+ compatibility...")
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     # Extract training state
     start_step = checkpoint['step']
@@ -138,7 +143,7 @@ def resume_single_gpu(checkpoint_path, resume_config):
                     'config': resume_config,
                     'loss': loss.item(),
                     'resumed_from': checkpoint_path,
-                }, checkpoint_path)
+                }, checkpoint_path, _use_new_zipfile_serialization=False)
                 print(f"💾 Saved checkpoint to {checkpoint_path}")
             
             # Check if we've reached max steps
@@ -185,7 +190,14 @@ def main():
     
     # Load checkpoint to get config
     print(f"🔄 Loading checkpoint to get configuration...")
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    try:
+        # Try loading with weights_only=False for PyTorch 2.6+ compatibility
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    except Exception as e:
+        print(f"⚠️ Standard loading failed: {e}")
+        print("🔄 Trying with weights_only=False for PyTorch 2.6+ compatibility...")
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    
     original_config = checkpoint['config']
     
     # Create resume config (can override some parameters)
