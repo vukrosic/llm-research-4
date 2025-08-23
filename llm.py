@@ -11,7 +11,7 @@ from tqdm import tqdm
 import time
 from transformers import AutoTokenizer
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Dict
 import warnings
 import os
 import pickle
