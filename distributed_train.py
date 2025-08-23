@@ -77,6 +77,12 @@ def train_worker(rank, world_size, config):
         print(f"🚀 Starting distributed training on {world_size} GPUs")
         print(f"📊 Total parameters: {sum(p.numel() for p in model.parameters()):,}")
     
+    # Checkpoint directory
+    checkpoint_dir = "checkpoints"
+    if rank == 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    step = 0
     for epoch in range(config.max_steps // len(train_loader) + 1):
         train_sampler.set_epoch(epoch)
         
@@ -115,8 +121,23 @@ def train_worker(rank, world_size, config):
                     optimizer.step()
                     optimizer.zero_grad()
             
+            step += 1
+            
             if rank == 0 and batch_idx % 100 == 0:
-                print(f"Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}")
+                print(f"Epoch {epoch}, Batch {batch_idx}, Step {step}, Loss: {loss.item():.4f}")
+            
+            # Save checkpoint every 500 steps
+            if rank == 0 and step % 500 == 0:
+                checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{step}.pt")
+                torch.save({
+                    'step': step,
+                    'epoch': epoch,
+                    'model_state_dict': model.module.state_dict(),
+                    'optimizer_states': [opt.state_dict() for opt in optimizers],
+                    'config': config,
+                    'loss': loss.item(),
+                }, checkpoint_path)
+                print(f"💾 Saved checkpoint to {checkpoint_path}")
     
     if rank == 0:
         print("✅ Training completed!")
