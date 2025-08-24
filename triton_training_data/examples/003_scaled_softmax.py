@@ -3,7 +3,7 @@
 # <PYTHON>
 def scaled_softmax(x, scale):
     # Multiple kernels:
-    x_scaled = x / math.sqrt(scale)  # Kernel 1: div
+    x_scaled = x / torch.sqrt(scale)  # Kernel 1: div
     x_max = x_scaled.max(dim=-1, keepdim=True)[0]   # Kernel 2: max reduction
     x_safe = x_scaled - x_max                             # Kernel 3: sub
     exp_x = torch.exp(x_safe)                      # Kernel 4: exp

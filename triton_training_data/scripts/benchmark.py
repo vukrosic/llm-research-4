@@ -11,7 +11,6 @@ import inspect
 
 def count_kernel_launches(code):
     """Estimate kernel launches from Python code"""
-    # Count operations that trigger kernels
     ops = ['torch.matmul', '@', '+', '-', '*', '/', 'torch.relu', 
            'torch.exp', 'torch.sigmoid', '.sum(', '.max(', '.mean(']
     return sum(1 for op in ops if op in code)
@@ -25,63 +24,55 @@ def benchmark_file(filepath):
     triton_code = re.search(r'# <TRITON>(.*?)# </TRITON>', content, re.DOTALL).group(1)
     test_code = re.search(r'# <TEST>(.*?)# </TEST>', content, re.DOTALL).group(1)
     
-    # Count approximate kernel launches
     kernel_launches_python = count_kernel_launches(python_code)
-    kernel_launches_triton = 1  # Always 1 for fused kernel
+    kernel_launches_triton = 1
     
-    # Rest of benchmark...
-    namespace = {'torch': torch}
-    
-    exec(python_code, namespace)
-    # Infer the function name from the file name (e.g., 001_linear_relu.py -> linear_relu)
+    py_namespace = {'torch': torch, 'math': __import__('math')}
+    exec(python_code, py_namespace)
     func_name = filepath.stem.split('_', 1)[1]
-    py_func = namespace[func_name]
+    py_func = py_namespace[func_name]
 
-    # Write triton code to a temp file to allow inspect to get source
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        # Add necessary imports to the temp file
-        f.write("import torch\n")
-        f.write("import triton\n")
-        f.write("import triton.language as tl\n")
-        f.write("import math\n")
-        f.write(triton_code)
-        temp_filename = f.name
-
+    temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
     try:
-        spec = importlib.util.spec_from_file_location("triton_module", temp_filename)
+        temp_file.write("import torch\n")
+        temp_file.write("import triton\n")
+        temp_file.write("import triton.language as tl\n")
+        temp_file.write("import math\n")
+        temp_file.write(triton_code)
+        temp_file.close()
+
+        spec = importlib.util.spec_from_file_location("triton_module", temp_file.name)
         triton_module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(triton_module)
         tr_func = getattr(triton_module, func_name)
-    finally:
-        os.remove(temp_filename)
 
-    exec(test_code, namespace)
-    inputs = namespace['get_test_inputs']()
-    
-    # Warmup
-    for _ in range(10):
-        py_func(*inputs)
-        tr_func(*inputs)
-    
-    # Benchmark
-    torch.cuda.synchronize()
-    start = time.perf_counter()
-    for _ in range(100):
-        out_py = py_func(*inputs)
-    torch.cuda.synchronize()
-    py_time = time.perf_counter() - start
-    
-    torch.cuda.synchronize()
-    start = time.perf_counter()
-    for _ in range(100):
-        out_tr = tr_func(*inputs)
-    torch.cuda.synchronize()
-    tr_time = time.perf_counter() - start
-    
-    # Verify correctness
-    # Loosen tolerance for more complex operations
-    correct = torch.allclose(out_py, out_tr, rtol=1e-2, atol=1e-2)
-    
+        test_namespace = {'torch': torch}
+        exec(test_code, test_namespace)
+        inputs = test_namespace['get_test_inputs']()
+        
+        # Warmup
+        for _ in range(10):
+            py_func(*inputs)
+            tr_func(*inputs)
+        
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        for _ in range(100):
+            out_py = py_func(*inputs)
+        torch.cuda.synchronize()
+        py_time = time.perf_counter() - start
+        
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        for _ in range(100):
+            out_tr = tr_func(*inputs)
+        torch.cuda.synchronize()
+        tr_time = time.perf_counter() - start
+        
+        correct = torch.allclose(out_py, out_tr, rtol=1e-2, atol=1e-2)
+    finally:
+        os.remove(temp_file.name)
+
     return {
         'name': filepath.stem,
         'python_ms': py_time * 1000 / 100,
@@ -92,7 +83,6 @@ def benchmark_file(filepath):
     }
 
 if __name__ == "__main__":
-    # Ensure we are in the correct directory
     script_dir = Path(__file__).parent.resolve()
     base_dir = script_dir.parent
     examples_dir = base_dir / "examples"
@@ -101,7 +91,6 @@ if __name__ == "__main__":
 
     results = []
     
-    # Correctly glob for files in the examples directory
     for file in sorted(examples_dir.glob("*.py")):
         print(f"Benchmarking {file.name}...", end=" ")
         try:
@@ -114,10 +103,9 @@ if __name__ == "__main__":
             print(f"FAILED: {e}")
 
     if not results:
-        print("No benchmark results.")
+        print("\nNo benchmark results.")
         exit()
     
-    # Save and summarize
     results_path = output_dir / "benchmark_results.csv"
     with open(results_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=results[0].keys())
@@ -126,7 +114,6 @@ if __name__ == "__main__":
     
     print(f"\nResults saved to {results_path}")
 
-    # Filter for successful runs before calculating averages
     successful_results = [r for r in results if r['correct']]
     if successful_results:
         avg_speedup = sum(r['speedup'] for r in successful_results) / len(successful_results)

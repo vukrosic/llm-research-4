@@ -78,7 +78,7 @@ def get_test_inputs():
     in_features = 768
     out_features = 3072
     x = torch.randn(batch_size, in_features, device='cuda', dtype=torch.float16)
-    weight = torch.randn(in_features, out_features, device='cuda', dtype=torch.float16).T
+    weight = torch.randn(in_features, out_features, device='cuda', dtype=torch.float16)
     bias = torch.randn(out_features, device='cuda', dtype=torch.float16)
     return (x, weight, bias)
 # </TEST>
