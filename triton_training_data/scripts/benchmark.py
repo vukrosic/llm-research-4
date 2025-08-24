@@ -7,30 +7,30 @@ from pathlib import Path
 import tempfile
 import importlib.util
 import os
+import sys
+import json
 
-def benchmark_and_classify(filepath, faster_dir, slower_dir):
-    """Benchmarks a single file and classifies it into faster/slower."""
+def run_benchmark_on_file(filepath):
+    """Runs the benchmark for a single file and returns a result dictionary."""
     with open(filepath, 'r') as f:
         content = f.read()
 
+    # --- Parsing --- #
     try:
         python_code = re.search(r'# <PYTHON>(.*?)# </PYTHON>', content, re.DOTALL).group(1)
         triton_code = re.search(r'# <TRITON>(.*?)# </TRITON>', content, re.DOTALL).group(1)
         test_code = re.search(r'# <TEST>(.*?)# </TEST>', content, re.DOTALL).group(1)
     except AttributeError:
-        print(f"SKIPPING {filepath.name}: Could not parse file structure.")
-        return
+        return {"status": "FAILED", "reason": "Could not parse file structure."}
 
-    # Prepare namespaces and function name
-    py_namespace = {}
-    exec(python_code, py_namespace)
-    func_name = [k for k, v in py_namespace.items() if callable(v)][0]
-    py_func = py_namespace[func_name]
-
-    # Use temp file for Triton code to ensure inspect can find the source
+    # --- Execution --- #
     temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
-    tr_func = None
     try:
+        py_namespace = {}
+        exec(python_code, py_namespace)
+        func_name = [k for k, v in py_namespace.items() if callable(v)][0]
+        py_func = py_namespace[func_name]
+
         temp_file.write(triton_code)
         temp_file.close()
 
@@ -62,52 +62,57 @@ def benchmark_and_classify(filepath, faster_dir, slower_dir):
         torch.cuda.synchronize()
         tr_time = time.perf_counter() - start
 
-        # Verification and Classification
         correct = torch.allclose(out_py, out_tr, rtol=1e-2, atol=1e-2)
         speedup = py_time / tr_time
 
-        print(f"Speedup: {speedup:.2f}x, Correct: {'Yes' if correct else 'NO'}")
-
-        if correct and speedup > 1.0:
-            shutil.copy(filepath, faster_dir / filepath.name)
-            print(f"CLASSIFIED as faster.")
-        else:
-            shutil.copy(filepath, slower_dir / filepath.name)
-            print(f"CLASSIFIED as slower/incorrect.")
+        return {
+            "status": "SUCCESS",
+            "correct": correct,
+            "speedup": speedup,
+            "python_ms": py_time * 10,
+            "triton_ms": tr_time * 10,
+        }
 
     except Exception as e:
-        print(f"FAILED: {e}")
-        shutil.copy(filepath, slower_dir / filepath.name)
-        print(f"CLASSIFIED as slower/failed.")
+        return {"status": "FAILED", "reason": str(e)}
     finally:
         if os.path.exists(temp_file.name):
             os.remove(temp_file.name)
 
-if __name__ == "__main__":
-    script_dir = Path(__file__).parent.resolve()
-    base_dir = script_dir.parent
+def classify_all_examples(base_dir):
+    """Runs benchmark on all examples and classifies them."""
     examples_dir = base_dir / "examples"
     output_dir = base_dir / "output"
-
     faster_dir = output_dir / "faster"
     slower_dir = output_dir / "slower"
 
-    # Clean up previous runs
-    if faster_dir.exists():
-        shutil.rmtree(faster_dir)
-    if slower_dir.exists():
-        shutil.rmtree(slower_dir)
-
+    if faster_dir.exists(): shutil.rmtree(faster_dir)
+    if slower_dir.exists(): shutil.rmtree(slower_dir)
     faster_dir.mkdir(exist_ok=True, parents=True)
     slower_dir.mkdir(exist_ok=True, parents=True)
 
-    print(f"Classifying examples from: {examples_dir}")
-    print(f"Faster examples will be saved to: {faster_dir}")
-    print(f"Slower examples will be saved to: {slower_dir}\n")
-
+    print(f"Classifying examples from: {examples_dir}\n")
     for file in sorted(examples_dir.glob("*.py")):
         print(f"--- Benchmarking {file.name} ---")
-        benchmark_and_classify(file, faster_dir, slower_dir)
+        result = run_benchmark_on_file(file)
+        if result["status"] == "SUCCESS" and result["correct"] and result["speedup"] > 1.0:
+            print(f"RESULT: FASTER ({result['speedup']:.2f}x speedup)")
+            shutil.copy(file, faster_dir / file.name)
+        else:
+            reason = result.get('reason', f"slower/incorrect (speedup: {result.get('speedup', 0):.2f}x, correct: {result.get('correct', False)})")
+            print(f"RESULT: SLOWER or FAILED ({reason})")
+            shutil.copy(file, slower_dir / file.name)
         print("---\n")
-
     print("Classification complete.")
+
+if __name__ == "__main__":
+    script_dir = Path(__file__).parent.resolve()
+    base_dir = script_dir.parent
+
+    # If a file path is provided as an argument, test it. Otherwise, classify all.
+    if len(sys.argv) > 1:
+        filepath = Path(sys.argv[1])
+        result = run_benchmark_on_file(filepath)
+        print(json.dumps(result)) # Output machine-readable JSON
+    else:
+        classify_all_examples(base_dir)
