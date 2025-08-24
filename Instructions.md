@@ -399,3 +399,5 @@ FUSED_OPERATIONS = [
 ```
 
 This approach focuses on **real performance gains** from kernel fusion, making the training data much more valuable for learning when and how to use Triton effectively.
+
+Just the first 3 are enough for now, don't generate more.
