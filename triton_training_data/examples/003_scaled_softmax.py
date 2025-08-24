@@ -1,6 +1,9 @@
 """Scaled softmax for attention: softmax(x / sqrt(scale))"""
 
 # <PYTHON>
+import torch
+import math
+
 def scaled_softmax(x, scale):
     # Multiple kernels:
     x_scaled = x / torch.sqrt(scale)  # Kernel 1: div
@@ -18,28 +21,22 @@ import triton.language as tl
 import math
 
 @triton.jit
-def scaled_softmax_kernel(input_ptr, output_ptr, n_cols, scale,
-                         BLOCK_SIZE: tl.constexpr):
+def scaled_softmax_kernel(input_ptr, output_ptr, n_cols, scale, BLOCK_SIZE: tl.constexpr):
     row_idx = tl.program_id(0)
     row_start_ptr = input_ptr + row_idx * n_cols
     
-    # Load entire row
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < n_cols
     row = tl.load(row_start_ptr + col_offsets, mask=mask, other=-float('inf'))
     
-    # Scale
-    scale_sqrt = tl.sqrt(scale.to(tl.float32)) # Ensure scale is float for sqrt
-    row = row / scale_sqrt
+    row = row / tl.sqrt(scale)
     
-    # Softmax - all fused
     row_max = tl.max(row, axis=0)
     row = row - row_max
     exp_row = tl.exp(row)
     sum_exp_row = tl.sum(exp_row, axis=0)
     softmax_row = exp_row / sum_exp_row
     
-    # Store
     output_row_start_ptr = output_ptr + row_idx * n_cols
     tl.store(output_row_start_ptr + col_offsets, softmax_row, mask=mask)
 
@@ -47,13 +44,15 @@ def scaled_softmax(x, scale):
     output = torch.empty_like(x)
     n_rows, n_cols = x.shape
     grid = (n_rows,)
-    # Let triton select next power of 2
     BLOCK_SIZE = triton.next_power_of_2(n_cols)
-    scaled_softmax_kernel[grid](x, output, n_cols, scale, BLOCK_SIZE=BLOCK_SIZE)
+    # Pass scale as a float to the kernel
+    scaled_softmax_kernel[grid](x, output, n_cols, scale.item(), BLOCK_SIZE=BLOCK_SIZE)
     return output
 # </TRITON>
 
 # <TEST>
+import torch
+
 def get_test_inputs():
     batch_size = 32
     seq_len = 512

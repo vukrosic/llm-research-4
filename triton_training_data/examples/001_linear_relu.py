@@ -1,6 +1,8 @@
 """Linear transformation with fused ReLU activation"""
 
 # <PYTHON>
+import torch
+
 def linear_relu(x, weight, bias):
     # Three separate kernels in PyTorch:
     output = torch.matmul(x, weight)  # Kernel 1: matmul
@@ -19,7 +21,7 @@ def linear_relu_kernel(
     x_ptr, weight_ptr, bias_ptr, output_ptr,
     M, N, K,
     stride_xm, stride_xk,
-    stride_wn, stride_wk, # Note: Swapped in dot, so wk, wn
+    stride_wk, stride_wn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
 ):
     pid_m = tl.program_id(0)
@@ -27,30 +29,27 @@ def linear_relu_kernel(
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-
-    x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-    w_ptrs = weight_ptr + (offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn)
-
+    
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
     for k in range(0, K, BLOCK_K):
-        x_chunk = tl.load(x_ptrs)
-        w_chunk = tl.load(w_ptrs)
+        offs_k = k + tl.arange(0, BLOCK_K)
+        x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+        w_ptrs = weight_ptr + (offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn)
+        
+        x_chunk = tl.load(x_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
+        w_chunk = tl.load(w_ptrs, mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
+        
         acc += tl.dot(x_chunk, w_chunk)
-        x_ptrs += BLOCK_K * stride_xk
-        w_ptrs += BLOCK_K * stride_wk
 
-    # Add bias
     bias_ptrs = bias_ptr + offs_n
-    bias_chunk = tl.load(bias_ptrs)
-    acc = acc + bias_chunk[None, :]
+    bias_chunk = tl.load(bias_ptrs, mask=offs_n < N, other=0.0)
+    
+    output = acc + bias_chunk[None, :]
+    output = tl.maximum(output, 0)
 
-    # Apply ReLU
-    output = tl.maximum(acc, 0)
-
-    # Store output
     output_ptrs = output_ptr + offs_m[:, None] * N + offs_n[None, :]
-    tl.store(output_ptrs, output)
+    tl.store(output_ptrs, output.to(x_ptr.dtype.element_ty), mask=offs_m[:, None] < M)
 
 def linear_relu(x, weight, bias):
     M, K = x.shape
@@ -73,6 +72,8 @@ def linear_relu(x, weight, bias):
 # </TRITON>
 
 # <TEST>
+import torch
+
 def get_test_inputs():
     batch_size = 128
     in_features = 768

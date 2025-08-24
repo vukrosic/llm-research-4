@@ -1,6 +1,8 @@
 """Fused arithmetic operations: (x + y) * z + w"""
 
 # <PYTHON>
+import torch
+
 def add_mul_add(x, y, z, w):
     # Three separate kernels:
     temp1 = x + y      # Kernel 1
@@ -42,6 +44,8 @@ def add_mul_add(x, y, z, w):
 # </TRITON>
 
 # <TEST>
+import torch
+
 def get_test_inputs():
     size = 1000000
     x = torch.randn(size, device='cuda', dtype=torch.float32)

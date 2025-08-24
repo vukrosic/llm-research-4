@@ -2,42 +2,35 @@
 import re
 import torch
 import time
-import csv
+import shutil
 from pathlib import Path
 import tempfile
 import importlib.util
 import os
-import inspect
 
-def count_kernel_launches(code):
-    """Estimate kernel launches from Python code"""
-    ops = ['torch.matmul', '@', '+', '-', '*', '/', 'torch.relu', 
-           'torch.exp', 'torch.sigmoid', '.sum(', '.max(', '.mean(']
-    return sum(1 for op in ops if op in code)
-
-def benchmark_file(filepath):
-    """Benchmark with kernel launch counting"""
+def benchmark_and_classify(filepath, faster_dir, slower_dir):
+    """Benchmarks a single file and classifies it into faster/slower."""
     with open(filepath, 'r') as f:
         content = f.read()
-    
-    python_code = re.search(r'# <PYTHON>(.*?)# </PYTHON>', content, re.DOTALL).group(1)
-    triton_code = re.search(r'# <TRITON>(.*?)# </TRITON>', content, re.DOTALL).group(1)
-    test_code = re.search(r'# <TEST>(.*?)# </TEST>', content, re.DOTALL).group(1)
-    
-    kernel_launches_python = count_kernel_launches(python_code)
-    kernel_launches_triton = 1
-    
-    py_namespace = {'torch': torch, 'math': __import__('math')}
+
+    try:
+        python_code = re.search(r'# <PYTHON>(.*?)# </PYTHON>', content, re.DOTALL).group(1)
+        triton_code = re.search(r'# <TRITON>(.*?)# </TRITON>', content, re.DOTALL).group(1)
+        test_code = re.search(r'# <TEST>(.*?)# </TEST>', content, re.DOTALL).group(1)
+    except AttributeError:
+        print(f"SKIPPING {filepath.name}: Could not parse file structure.")
+        return
+
+    # Prepare namespaces and function name
+    py_namespace = {}
     exec(python_code, py_namespace)
-    func_name = filepath.stem.split('_', 1)[1]
+    func_name = [k for k, v in py_namespace.items() if callable(v)][0]
     py_func = py_namespace[func_name]
 
+    # Use temp file for Triton code to ensure inspect can find the source
     temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
+    tr_func = None
     try:
-        temp_file.write("import torch\n")
-        temp_file.write("import triton\n")
-        temp_file.write("import triton.language as tl\n")
-        temp_file.write("import math\n")
         temp_file.write(triton_code)
         temp_file.close()
 
@@ -46,79 +39,75 @@ def benchmark_file(filepath):
         spec.loader.exec_module(triton_module)
         tr_func = getattr(triton_module, func_name)
 
-        test_namespace = {'torch': torch}
+        test_namespace = {}
         exec(test_code, test_namespace)
         inputs = test_namespace['get_test_inputs']()
-        
-        # Warmup
+
+        # Warmup and Benchmark
         for _ in range(10):
             py_func(*inputs)
             tr_func(*inputs)
-        
+
         torch.cuda.synchronize()
         start = time.perf_counter()
         for _ in range(100):
             out_py = py_func(*inputs)
         torch.cuda.synchronize()
         py_time = time.perf_counter() - start
-        
+
         torch.cuda.synchronize()
         start = time.perf_counter()
         for _ in range(100):
             out_tr = tr_func(*inputs)
         torch.cuda.synchronize()
         tr_time = time.perf_counter() - start
-        
-        correct = torch.allclose(out_py, out_tr, rtol=1e-2, atol=1e-2)
-    finally:
-        os.remove(temp_file.name)
 
-    return {
-        'name': filepath.stem,
-        'python_ms': py_time * 1000 / 100,
-        'triton_ms': tr_time * 1000 / 100,
-        'speedup': py_time / tr_time,
-        'kernels_saved': kernel_launches_python - kernel_launches_triton,
-        'correct': correct
-    }
+        # Verification and Classification
+        correct = torch.allclose(out_py, out_tr, rtol=1e-2, atol=1e-2)
+        speedup = py_time / tr_time
+
+        print(f"Speedup: {speedup:.2f}x, Correct: {'Yes' if correct else 'NO'}")
+
+        if correct and speedup > 1.0:
+            shutil.copy(filepath, faster_dir / filepath.name)
+            print(f"CLASSIFIED as faster.")
+        else:
+            shutil.copy(filepath, slower_dir / filepath.name)
+            print(f"CLASSIFIED as slower/incorrect.")
+
+    except Exception as e:
+        print(f"FAILED: {e}")
+        shutil.copy(filepath, slower_dir / filepath.name)
+        print(f"CLASSIFIED as slower/failed.")
+    finally:
+        if os.path.exists(temp_file.name):
+            os.remove(temp_file.name)
 
 if __name__ == "__main__":
     script_dir = Path(__file__).parent.resolve()
     base_dir = script_dir.parent
     examples_dir = base_dir / "examples"
     output_dir = base_dir / "output"
-    output_dir.mkdir(exist_ok=True)
 
-    results = []
-    
+    faster_dir = output_dir / "faster"
+    slower_dir = output_dir / "slower"
+
+    # Clean up previous runs
+    if faster_dir.exists():
+        shutil.rmtree(faster_dir)
+    if slower_dir.exists():
+        shutil.rmtree(slower_dir)
+
+    faster_dir.mkdir(exist_ok=True, parents=True)
+    slower_dir.mkdir(exist_ok=True, parents=True)
+
+    print(f"Classifying examples from: {examples_dir}")
+    print(f"Faster examples will be saved to: {faster_dir}")
+    print(f"Slower examples will be saved to: {slower_dir}\n")
+
     for file in sorted(examples_dir.glob("*.py")):
-        print(f"Benchmarking {file.name}...", end=" ")
-        try:
-            result = benchmark_file(file)
-            results.append(result)
-            print(f"{result['speedup']:.2f}x speedup, "
-                  f"{result['kernels_saved']} kernels saved, "
-                  f"Correct: {'Yes' if result['correct'] else 'NO'}")
-        except Exception as e:
-            print(f"FAILED: {e}")
+        print(f"--- Benchmarking {file.name} ---")
+        benchmark_and_classify(file, faster_dir, slower_dir)
+        print("---\n")
 
-    if not results:
-        print("\nNo benchmark results.")
-        exit()
-    
-    results_path = output_dir / "benchmark_results.csv"
-    with open(results_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=results[0].keys())
-        writer.writeheader()
-        writer.writerows(results)
-    
-    print(f"\nResults saved to {results_path}")
-
-    successful_results = [r for r in results if r['correct']]
-    if successful_results:
-        avg_speedup = sum(r['speedup'] for r in successful_results) / len(successful_results)
-        total_kernels_saved = sum(r['kernels_saved'] for r in successful_results)
-        print(f"\nAverage speedup (correct results): {avg_speedup:.2f}x")
-        print(f"Total kernels saved (correct results): {total_kernels_saved}")
-    else:
-        print("\nNo successful runs to average.")
+    print("Classification complete.")
