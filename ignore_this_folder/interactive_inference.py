@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 import os
 import glob
-from llm import MinimalLLM, ModelConfig, TextTokenDataset
+from ignore_this_folder.llm import MinimalLLM, ModelConfig, TextTokenDataset
 from data_server import CentralDataServer
 import argparse
 

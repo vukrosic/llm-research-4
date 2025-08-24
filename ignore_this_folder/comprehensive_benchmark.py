@@ -6,7 +6,7 @@ Comprehensive benchmarking script for all Triton kernels
 import torch
 import time
 import numpy as np
-from llm import (
+from ignore_this_folder.llm import (
     benchmark_rms_norm, benchmark_rotary, benchmark_mlp, 
     benchmark_attention, benchmark_newton_schulz
 )
@@ -186,7 +186,7 @@ def memory_efficiency_test():
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
             
-            from llm import TritonRMSNormLayer
+            from ignore_this_folder.llm import TritonRMSNormLayer
             triton_norm = TritonRMSNormLayer(d_model).to('cuda', dtype=torch.float16)
             _ = triton_norm(x)
             triton_memory = torch.cuda.max_memory_allocated() / 1024**2

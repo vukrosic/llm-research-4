@@ -6,7 +6,7 @@ Enhanced test script for all Triton kernels in llm.py
 import torch
 import torch.nn as nn
 import time
-from llm import (
+from ignore_this_folder.llm import (
     ModelConfig, MinimalLLM, auto_select_kernels, manual_kernel_benchmark,
     benchmark_rms_norm, benchmark_rotary, benchmark_mlp, benchmark_attention, benchmark_newton_schulz
 )

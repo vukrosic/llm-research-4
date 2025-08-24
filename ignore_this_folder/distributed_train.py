@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.cuda.amp import autocast, GradScaler
 import os
 import time
-from llm import MinimalLLM, ModelConfig, set_seed, setup_muon_optimizer, evaluate_model, TextTokenDataset
+from ignore_this_folder.llm import MinimalLLM, ModelConfig, set_seed, setup_muon_optimizer, evaluate_model, TextTokenDataset
 from data_server import CentralDataServer
 
 def setup_distributed(rank, world_size):

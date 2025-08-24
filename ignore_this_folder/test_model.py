@@ -5,7 +5,7 @@ Simple script to test the loaded model
 
 import torch
 import torch.nn.functional as F
-from llm import MinimalLLM, ModelConfig
+from ignore_this_folder.llm import MinimalLLM, ModelConfig
 from data_server import CentralDataServer
 import argparse
 import os

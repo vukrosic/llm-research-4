@@ -21,7 +21,7 @@ def test_dtype_handling():
     try:
         # Test 1: RMSNorm
         print("\n🔍 Test 1: RMSNorm Dtype Handling")
-        from llm import TritonRMSNormLayer
+        from ignore_this_folder.llm import TritonRMSNormLayer
         
         rms_norm = TritonRMSNormLayer(128)
         rms_norm = rms_norm.to('cuda', dtype=torch.float16)
@@ -32,7 +32,7 @@ def test_dtype_handling():
         
         # Test 2: Rotary
         print("\n🔍 Test 2: Rotary Dtype Handling")
-        from llm import Rotary
+        from ignore_this_folder.llm import Rotary
         
         rotary = Rotary(64, 128)
         rotary = rotary.to('cuda', dtype=torch.float16)
@@ -45,7 +45,7 @@ def test_dtype_handling():
         
         # Test 3: MultiHeadAttention
         print("\n🔍 Test 3: MultiHeadAttention Dtype Handling")
-        from llm import MultiHeadAttention
+        from ignore_this_folder.llm import MultiHeadAttention
         
         attention = MultiHeadAttention(128, 8, 64)
         attention = attention.to('cuda', dtype=torch.float16)
@@ -56,7 +56,7 @@ def test_dtype_handling():
         
         # Test 4: FeedForward
         print("\n🔍 Test 4: FeedForward Dtype Handling")
-        from llm import FeedForward
+        from ignore_this_folder.llm import FeedForward
         
         ff = FeedForward(128, 512)
         ff = ff.to('cuda', dtype=torch.float16)

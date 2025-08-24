@@ -5,7 +5,7 @@ Test script to verify Triton integration in llm.py
 
 import torch
 import torch.nn as nn
-from llm import ModelConfig, MinimalLLM, auto_select_kernels, manual_kernel_benchmark
+from ignore_this_folder.llm import ModelConfig, MinimalLLM, auto_select_kernels, manual_kernel_benchmark
 
 def test_triton_integration():
     """Test that Triton kernels are properly integrated"""
