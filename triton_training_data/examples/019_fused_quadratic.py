@@ -30,7 +30,7 @@ def quadratic_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     output = x + x_squared
     
     # Store result
-    tl.store(output_ptr + offsets, output, mask=mask)
+    tl.store(output_ptr + offsets, output.to(x.dtype), mask=mask)
 
 def fused_quadratic(x):
     output = torch.empty_like(x)

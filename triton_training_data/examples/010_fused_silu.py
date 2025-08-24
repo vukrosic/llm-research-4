@@ -26,11 +26,11 @@ def silu_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     x = tl.load(x_ptr + offsets, mask=mask)
     
     # Compute SiLU in one step: x * sigmoid(x)
-    sigmoid_x = tl.sigmoid(x)
+    sigmoid_x = tl.sigmoid(x.to(tl.float32))
     output = x * sigmoid_x
     
     # Store result
-    tl.store(output_ptr + offsets, output, mask=mask)
+    tl.store(output_ptr + offsets, output.to(x.dtype), mask=mask)
 
 def fused_silu(x):
     output = torch.empty_like(x)

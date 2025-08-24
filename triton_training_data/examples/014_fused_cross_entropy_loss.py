@@ -76,7 +76,7 @@ def fused_cross_entropy_loss(logits, targets, label_smoothing=0.1):
         BLOCK_SIZE=triton.next_power_of_2(n_cols)
     )
     
-    return tl.sum(loss) / n_rows
+    return torch.sum(loss) / n_rows
 # </TRITON>
 
 # <TEST>

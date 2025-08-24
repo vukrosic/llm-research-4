@@ -62,7 +62,7 @@ def mlp_kernel(
     
     # Apply activation
     if ACTIVATION == "gelu":
-        hidden = tl.sigmoid(1.702 * hidden) * hidden  # Approximate GELU
+        hidden = tl.sigmoid(1.702 * hidden.to(tl.float32)) * hidden  # Approximate GELU
     elif ACTIVATION == "relu":
         hidden = tl.maximum(hidden, 0.0)
     
@@ -73,8 +73,11 @@ def mlp_kernel(
     w2_ptrs = weight2_ptr + (offs_n[:, None] * stride_w2n + offs_p[None, :] * stride_w2p)
     
     for n in range(0, N, BLOCK_N):
-        hidden_block = tl.load(hidden + (offs_m[:, None] * N + (n + offs_n[None, :])), 
-                              mask=(offs_m[:, None] < M) & ((n + offs_n[None, :]) < N), other=0.0)
+        # Calculate the correct offset for the hidden tensor
+        hidden_offset = n  # Start of the current block in the N dimension
+        hidden_ptrs = hidden + (offs_m[:, None] * N + (hidden_offset + offs_n[None, :]))
+        hidden_block = tl.load(hidden_ptrs, 
+                              mask=(offs_m[:, None] < M) & ((hidden_offset + offs_n[None, :]) < N), other=0.0)
         w2_block = tl.load(w2_ptrs, mask=((n + offs_n[:, None]) < N) & (offs_p[None, :] < P), other=0.0)
         acc2 += tl.dot(hidden_block, w2_block)
         w2_ptrs += BLOCK_N * stride_w2n
@@ -86,7 +89,7 @@ def mlp_kernel(
     
     # Store result
     output_ptrs = output_ptr + (offs_m[:, None] * P + offs_p[None, :])
-    tl.store(output_ptrs, output, mask=(offs_m[:, None] < M) & (offs_p[None, :] < P))
+    tl.store(output_ptrs, output.to(x_ptr.dtype.element_ty), mask=(offs_m[:, None] < M) & (offs_p[None, :] < P))
 
 def fused_mlp(x, weight1, bias1, weight2, bias2, activation='gelu'):
     M, K = x.shape
