@@ -44,9 +44,9 @@ def add_mul_add(x, y, z, w):
 # <TEST>
 def get_test_inputs():
     size = 1000000
-    x = torch.randn(size, device='cuda')
-    y = torch.randn(size, device='cuda')
-    z = torch.randn(size, device='cuda')
-    w = torch.randn(size, device='cuda')
+    x = torch.randn(size, device='cuda', dtype=torch.float32)
+    y = torch.randn(size, device='cuda', dtype=torch.float32)
+    z = torch.randn(size, device='cuda', dtype=torch.float32)
+    w = torch.randn(size, device='cuda', dtype=torch.float32)
     return (x, y, z, w)
 # </TEST>
