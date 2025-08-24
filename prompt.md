@@ -4,8 +4,6 @@
 
 You are an expert AI agent specializing in high-performance GPU programming. Your primary mission is to generate a high-quality dataset of paired PyTorch and Triton code examples. This dataset will be used to train other models to automate the optimization of PyTorch code into efficient Triton kernels.
 
-Your workflow is a continuous loop of **proposing, generating, testing, and debugging** code examples.
-
 ## 2. The Core Task: Generating an Example
 
 Each data point you generate is a single Python file containing three distinct, specially-marked code blocks. You must strictly adhere to this format.
@@ -14,48 +12,16 @@ Each data point you generate is a single Python file containing three distinct, 
 
 -   **`# <TRITON>` block**: Contains the optimized, fused Triton kernel that performs the exact same operations as the `<PYTHON>` block, but in a single, efficient kernel launch. This is the target code that demonstrates the power of fusion.
 
--   **`# <TEST>` block**: Contains a function named `get_test_inputs()` that returns a tuple of realistic, randomly-initialized Torch tensors on the `cuda` device. This data is essential for verifying correctness and performance.
+-   **`# <TEST>` block**: A fair test that will test python vs triton for speed. There should also be main part below that will run the tests. It should all be in a single file.
 
 ## 3. Your Operational Workflow: The Generate-and-Verify Loop
 
-You will follow this precise workflow for every new example you create.
+1. You will follow this precise workflow for every new example you create.
 
-### Step 1: Get an Idea
+Generate a candidate file and execute it, if it's slower or failed, try to improve it, up to 3 times, if after 3 times still slower or failed, discard it and go onto next file.
 
-Read the `triton_training_data/fusion_ideas.txt` file. Pick one line (one fusion idea) to implement. You should proceed through this file sequentially.
+For successful files save it into JSONL:
 
-### Step 2: Generate a Candidate File
-
-Create a **single, temporary file** named exactly `triton_training_data/examples/temp_candidate.py`. Write the full, self-contained code for the `<PYTHON>`, `<TRITON>`, and `<TEST>` blocks for the fusion idea you selected.
-
-### Step 3: Test Your Candidate
-
-Execute the provided benchmark script on your temporary file. Use the following shell command:
-
-```bash
-python triton_training_data/scripts/benchmark.py triton_training_data/examples/temp_candidate.py
-```
-
-The script will run and output a single line of JSON containing the test results. This JSON will have a `"status"` field (`"SUCCESS"` or `"FAILED"`) and, on success, a `"correct"` field (`true` or `false`).
-
-### Step 4: Debug or Finalize (The Loop)
-
-You will now enter a loop that can run up to **three times**.
-
-1.  **Analyze the Result**: Read the JSON output from the test command.
-2.  **Check for Failure**: If the `"status"` is `"FAILED"` or if `"correct"` is `false`, you must debug.
-    -   Read the error message or analyze the code to find the bug.
-    -   Modify `triton_training_data/examples/temp_candidate.py` to fix the bug.
-    -   Go back to Step 3 and re-run the test. This counts as one attempt.
-3.  **Check for Success**: If the `"status"` is `"SUCCESS"` and `"correct"` is `true`, the loop ends. Proceed to Step 5.
-
-If you have not succeeded after **three** attempts, you must **abandon** this fusion idea. Delete the temporary file and go back to Step 1 to try the next idea from the list.
-
-### Step 5: Archive Successful Work
-
-Once an example is verified as correct, you must archive it to the final training dataset.
-
-1.  **Read the Code**: Open and read the contents of the successful `triton_training_data/examples/temp_candidate.py`.
 2.  **Construct JSON**: Create a JSON object with the following structure:
     ```json
     {
@@ -65,7 +31,8 @@ Once an example is verified as correct, you must archive it to the final trainin
       "test_code": "The entire content of the # <TEST> block."
     }
     ```
-3.  **Append to Dataset**: Append this JSON object as a **new line** to the file `triton_training_data/output/training_data.jsonl`. **Do not overwrite the file, only append.**
-4.  **Clean Up**: Delete the `triton_training_data/examples/temp_candidate.py` file.
+3.  **Clean Up**: Delete the testing file you generated.
 
 After cleanup, your cycle is complete. Return to Step 1 to begin work on the next fusion idea.
+
+check examples folder, also cehck fusion_ideas.txt, take 2-4 operations from this txt file randomly to create this data as I described.
