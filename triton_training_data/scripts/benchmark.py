@@ -73,18 +73,12 @@ def benchmark_file(filepath):
 if __name__ == "__main__":
     results = []
     
-    for file in sorted(Path("examples").glob("*.py")):
+    for file in sorted(Path("triton_training_data/examples").glob("*.py")):
         print(f"Benchmarking {file.name}...", end=" ")
         result = benchmark_file(file)
         results.append(result)
         print(f"{result['speedup']:.2f}x speedup, "
               f"{result['kernels_saved']} kernels saved")
-    
-    # Save and summarize
-    with open("output/benchmark_results.csv", 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=results[0].keys())
-        writer.writeheader()
-        writer.writerows(results)
     
     avg_speedup = sum(r['speedup'] for r in results) / len(results)
     total_kernels_saved = sum(r['kernels_saved'] for r in results)

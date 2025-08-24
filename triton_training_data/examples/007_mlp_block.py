@@ -43,11 +43,16 @@ def mlp_block_kernel(
     hidden = tl.tanh(hidden)
     
     # Second linear layer: hidden @ W2 + b2
+    # (In practice, you would store the hidden values to a temporary buffer and load from there)
     acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for l in range(0, L, BLOCK_L):
+        # Compute offset for the current block
+        hidden_offset = pid_m * BLOCK_M * L + l * BLOCK_M
+        w2_offset = l * stride_w2l + pid_n * BLOCK_N * stride_w2n
+        
         # Load blocks
-        a = tl.load(hidden + ...)
-        b = tl.load(w2_ptr + ...)
+        a = tl.load(output_ptr + hidden_offset + tl.arange(0, BLOCK_M), mask=tl.arange(0, BLOCK_M) < BLOCK_M)
+        b = tl.load(w2_ptr + w2_offset + tl.arange(0, BLOCK_N), mask=tl.arange(0, BLOCK_N) < BLOCK_N)
         acc2 += tl.dot(a, b)
     
     # Add bias

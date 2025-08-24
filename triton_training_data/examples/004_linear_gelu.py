@@ -31,8 +31,8 @@ def linear_gelu_kernel(
     
     for k in range(0, K, BLOCK_K):
         # Load blocks
-        a = tl.load(x_ptr + ...)
-        b = tl.load(weight_ptr + ...)
+        a = tl.load(x_ptr + pid_m * BLOCK_M * stride_xk + tl.arange(0, BLOCK_K) * stride_xk + tl.arange(0, BLOCK_M)[:, None] * stride_xm)
+        b = tl.load(weight_ptr + tl.arange(0, BLOCK_K)[:, None] * stride_wk + (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]) * stride_wn)
         acc += tl.dot(a, b)
     
     # Add bias
@@ -45,7 +45,7 @@ def linear_gelu_kernel(
     output = output * cdf
     
     # Store result
-    tl.store(output_ptr + ..., output)
+    tl.store(output_ptr + pid_m * BLOCK_M * N + pid_n * BLOCK_N + tl.arange(0, BLOCK_M)[:, None] * N + tl.arange(0, BLOCK_N)[None, :], output)
 
 def linear_gelu(x, weight, bias):
     # Wrapper that launches the fused kernel

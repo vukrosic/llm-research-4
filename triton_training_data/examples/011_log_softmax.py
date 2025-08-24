@@ -47,7 +47,7 @@ def log_softmax(x):
     n_rows, n_cols = x.shape
     grid = (n_rows,)
     BLOCK_SIZE = triton.next_power_of_2(n_cols)
-    log_softmax_kernel[grid](input_ptr, output, n_cols, BLOCK_SIZE)
+    log_softmax_kernel[grid](x, output, n_cols, BLOCK_SIZE)
     return output
 # </TRITON>
 
